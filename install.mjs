@@ -13,8 +13,8 @@
  *   node install.mjs verify         [--safe-mode] [--channel auto|stable|insiders] [--target-dir <dir>]
  *   node install.mjs rollback       [--target-dir <dir>]
  *   node install.mjs uninstall      [--target-dir <dir>]
- *   node install.mjs build-manifest
- *   node install.mjs pack
+ *   node install.mjs build-manifest [--set-version <X.Y.Z>]
+ *   node install.mjs pack           [--update-bundle] [--set-version <X.Y.Z>]
  */
 
 import fs from 'node:fs';
@@ -239,7 +239,10 @@ function resolveDefaultTargetDir() {
 // ============================================================================
 // 1. 生成与校验 core/manifest.json 及 dist/ 发行包
 // ============================================================================
-function buildManifest(baseDir = __dirname) {
+function buildManifest(baseDir = __dirname, opts = {}) {
+  const BASELINE_VERSION = '6.0.6';
+  const BASELINE_MIN_NODE = '22.0.0';
+  const BASELINE_MIN_ANTIGRAVITY = '2.34.0';
   const coreDir = path.join(baseDir, 'core');
   const files = ['daemon.mjs', 'runtime.js', 'theme.css', 'i18n.json'];
   const entries = {};
@@ -254,11 +257,68 @@ function buildManifest(baseDir = __dirname) {
       bytes: stat.size
     };
   }
+
+  const cliSetVersion = hasFlag('--set-version') ? getArg('--set-version', '') : null;
+  const rawSetVersion =
+    opts?.setVersion !== undefined && opts?.setVersion !== null ? opts.setVersion : cliSetVersion;
+  let explicitVersion = null;
+  if (rawSetVersion !== null) {
+    const trimmed = String(rawSetVersion).trim();
+    const m = trimmed.match(/^v?(\d+\.\d+\.\d+)$/);
+    if (!m) {
+      throw new Error(`Invalid --set-version "${rawSetVersion}". Expected format X.Y.Z or vX.Y.Z.`);
+    }
+    explicitVersion = m[1];
+  }
+
+  const manifestPath = path.join(coreDir, 'manifest.json');
+  let existingManifest = null;
+  if (fs.existsSync(manifestPath)) {
+    try {
+      existingManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    } catch {}
+  }
+
+  let version = BASELINE_VERSION;
+  if (explicitVersion) {
+    version = explicitVersion;
+  } else if (existingManifest && typeof existingManifest.version === 'string') {
+    const verMatch = existingManifest.version.trim().match(/^v?(\d+\.\d+\.\d+)$/);
+    if (verMatch) {
+      const existingTuple = extractBaseSemverTuple(verMatch[1]);
+      if (existingTuple && compareSemverTuples(existingTuple, extractBaseSemverTuple(BASELINE_VERSION)) >= 0) {
+        version = verMatch[1];
+      }
+    }
+  }
+
+  let minNodeVersion = BASELINE_MIN_NODE;
+  if (existingManifest && typeof existingManifest.minNodeVersion === 'string') {
+    const trimmedNode = existingManifest.minNodeVersion.trim();
+    if (/^\d+\.\d+\.\d+$/.test(trimmedNode)) {
+      const nodeTuple = extractBaseSemverTuple(trimmedNode);
+      if (nodeTuple && compareSemverTuples(nodeTuple, extractBaseSemverTuple(BASELINE_MIN_NODE)) > 0) {
+        minNodeVersion = trimmedNode;
+      }
+    }
+  }
+
+  let minAntigravityVersion = BASELINE_MIN_ANTIGRAVITY;
+  if (existingManifest && typeof existingManifest.minAntigravityVersion === 'string') {
+    const trimmedAg = existingManifest.minAntigravityVersion.trim();
+    if (/^\d+\.\d+\.\d+$/.test(trimmedAg)) {
+      const agTuple = extractBaseSemverTuple(trimmedAg);
+      if (agTuple && compareSemverTuples(agTuple, extractBaseSemverTuple(BASELINE_MIN_ANTIGRAVITY)) > 0) {
+        minAntigravityVersion = trimmedAg;
+      }
+    }
+  }
+
   const manifest = {
     name: 'chuanban-antigravity-theme-patch',
-    version: '6.0.6',
-    minNodeVersion: '22.0.0',
-    minAntigravityVersion: '2.34.0',
+    version,
+    minNodeVersion,
+    minAntigravityVersion,
     fullMetricsNodeVersion: '22.13.0',
     distribution: {
       notionGuide: NOTION_GUIDE_URL,
@@ -267,7 +327,6 @@ function buildManifest(baseDir = __dirname) {
     },
     files: entries
   };
-  const manifestPath = path.join(coreDir, 'manifest.json');
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
   return manifest;
 }
@@ -437,15 +496,15 @@ function extractChangelogHighlights(baseDir, version) {
   }
 }
 
-function buildDistZip(baseDir = __dirname, { updateBundleOnly = false } = {}) {
-  const manifest = buildManifest(baseDir);
+function buildDistZip(baseDir = __dirname, { updateBundleOnly = false, setVersion = null } = {}) {
+  const manifest = buildManifest(baseDir, setVersion !== null ? { setVersion } : {});
   const distDir = path.join(baseDir, 'dist');
   fs.mkdirSync(distDir, { recursive: true });
 
   const fullInclude = ['LICENSE', 'SKILL.md', 'README.md', 'CHANGELOG.md', 'install.mjs', '.gitattributes', '.gitignore', 'core', 'user', 'assets'].filter((item) =>
     fs.existsSync(path.join(baseDir, item))
   );
-  const slimInclude = ['LICENSE', 'SKILL.md', 'install.mjs', 'core', 'user'].filter((item) =>
+  const slimInclude = ['LICENSE', 'SKILL.md', 'README.md', 'CHANGELOG.md', 'install.mjs', 'core', 'user'].filter((item) =>
     fs.existsSync(path.join(baseDir, item))
   );
 
@@ -506,37 +565,65 @@ function buildDistZip(baseDir = __dirname, { updateBundleOnly = false } = {}) {
   };
 }
 
-function verifyCoreIntegrity(baseDir = __dirname) {
-  const coreDir = path.join(baseDir, 'core');
+function verifyCoreIntegrity(baseDir = __dirname, { coreDir = path.join(baseDir, 'core') } = {}) {
   const manifestPath = path.join(coreDir, 'manifest.json');
   if (!fs.existsSync(manifestPath)) {
     return { ok: false, reason: 'missing manifest.json', modified: [] };
   }
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    return { ok: false, reason: 'invalid manifest.json', modified: [] };
+  }
+  if (!manifest || typeof manifest !== 'object' || !manifest.files || typeof manifest.files !== 'object' || Object.keys(manifest.files).length === 0) {
+    return { ok: false, reason: 'invalid manifest.json', modified: [] };
+  }
+  const resolvedCoreRoot = path.resolve(coreDir);
+  const resolvedCorePrefix = resolvedCoreRoot.endsWith(path.sep) ? resolvedCoreRoot : resolvedCoreRoot + path.sep;
   const modified = [];
-  for (const [name, meta] of Object.entries(manifest.files || {})) {
-    const p = path.join(coreDir, name);
+  for (const [name, meta] of Object.entries(manifest.files)) {
+    if (
+      !name ||
+      typeof name !== 'string' ||
+      name.includes('\0') ||
+      name.includes('..') ||
+      path.basename(name) !== name
+    ) {
+      modified.push({ file: String(name), status: 'invalid_manifest_entry' });
+      continue;
+    }
+    const p = path.resolve(resolvedCoreRoot, name);
+    if (!p.startsWith(resolvedCorePrefix)) {
+      modified.push({ file: name, status: 'invalid_manifest_entry' });
+      continue;
+    }
+    if (!meta || typeof meta !== 'object' || typeof meta.sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(meta.sha256)) {
+      modified.push({ file: name, status: 'invalid_manifest_entry' });
+      continue;
+    }
     if (!fs.existsSync(p)) {
       modified.push({ file: name, status: 'missing' });
       continue;
     }
+    const expectedSha = meta.sha256.toLowerCase();
     let actualHash = sha256File(p);
-    if (actualHash !== meta.sha256) {
+    if (actualHash !== expectedSha) {
       // 自动自愈 Windows Git core.autocrlf=true 导致的 CRLF 换行符哈希差异
       try {
         const rawText = fs.readFileSync(p, 'utf8');
         if (rawText.includes('\r\n')) {
           const lfText = rawText.replace(/\r\n/g, '\n');
           const lfHash = crypto.createHash('sha256').update(Buffer.from(lfText, 'utf8')).digest('hex');
-          if (lfHash === meta.sha256) {
+          if (lfHash === expectedSha) {
             fs.writeFileSync(p, lfText, 'utf8');
             actualHash = lfHash;
           }
         }
       } catch {}
     }
-    if (actualHash !== meta.sha256) {
-      modified.push({ file: name, status: 'modified', expected: meta.sha256, actual: actualHash });
+    if (actualHash !== expectedSha) {
+      modified.push({ file: name, status: 'modified', expected: expectedSha, actual: actualHash });
     }
   }
   return { ok: modified.length === 0, manifest, modified };
@@ -562,6 +649,112 @@ function buildWin32LnkSpecsPs() {
   ];
 }
 
+function pickMinDetectedHostVersion(versions) {
+  const clean = [];
+  for (const raw of versions) {
+    const v = typeof raw === 'string' ? raw.trim() : '';
+    if (v) clean.push(v);
+  }
+  if (clean.length === 0) return null;
+  if (clean.length === 1) return clean[0];
+  const parseTuple = (s) => {
+    const m = String(s).match(/(\d+)\.(\d+)\.(\d+)/);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  };
+  let best = clean[0];
+  let bestTuple = parseTuple(best);
+  for (let i = 1; i < clean.length; i++) {
+    const cur = clean[i];
+    const curTuple = parseTuple(cur);
+    if (curTuple && bestTuple) {
+      const diff =
+        curTuple[0] !== bestTuple[0]
+          ? curTuple[0] - bestTuple[0]
+          : curTuple[1] !== bestTuple[1]
+          ? curTuple[1] - bestTuple[1]
+          : curTuple[2] - bestTuple[2];
+      if (diff < 0) {
+        best = cur;
+        bestTuple = curTuple;
+      }
+    } else if (curTuple && !bestTuple) {
+      best = cur;
+      bestTuple = curTuple;
+    }
+  }
+  return best;
+}
+
+function extractLinuxDesktopExecBinary(rawDesktop) {
+  const lines = String(rawDesktop || '').split(/\r?\n/);
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const m = trimmed.match(/^Exec\s*=\s*(.+)$/);
+    if (!m) continue;
+    const rhs = m[1].trim();
+    const tokens = [];
+    let cur = '';
+    let quote = '';
+    for (let i = 0; i < rhs.length; i++) {
+      const ch = rhs[i];
+      if (quote) {
+        if (ch === '\\' && i + 1 < rhs.length) {
+          cur += rhs[++i];
+        } else if (ch === quote) {
+          quote = '';
+        } else {
+          cur += ch;
+        }
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '\\' && i + 1 < rhs.length) {
+        cur += rhs[++i];
+      } else if (/\s/.test(ch)) {
+        if (cur.length > 0) {
+          tokens.push(cur);
+          cur = '';
+        }
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur.length > 0) tokens.push(cur);
+
+    let idx = 0;
+    while (idx < tokens.length) {
+      const tok = tokens[idx];
+      if (/^(?:\/usr\/bin\/|\/bin\/)?env$/.test(tok)) {
+        idx++;
+        while (idx < tokens.length) {
+          const envArg = tokens[idx];
+          if (envArg === '-u' || envArg === '--unset') {
+            idx += 2;
+          } else if (envArg === '--') {
+            idx++;
+            break;
+          } else if (envArg.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(envArg)) {
+            idx++;
+          } else {
+            break;
+          }
+        }
+        continue;
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+        idx++;
+        continue;
+      }
+      if (/^%[fFuUdDnNickvm%]$/.test(tok)) {
+        idx++;
+        continue;
+      }
+      return tok;
+    }
+  }
+  return '';
+}
+
 function readHostVersionAndProcesses(channel = 'auto') {
   const home = os.homedir();
   const allowStable = channel !== 'insiders';
@@ -571,22 +764,24 @@ function readHostVersionAndProcesses(channel = 'auto') {
   let launcherInstalled = false;
 
   if (process.platform === 'darwin') {
-    const appCandidates =
-      channel === 'insiders'
-        ? ['/Applications/Antigravity - Insiders.app', path.join(home, 'Applications/Antigravity - Insiders.app')]
-        : ['/Applications/Antigravity.app', path.join(home, 'Applications/Antigravity.app'), '/Applications/Antigravity - Insiders.app'];
-    for (const appBundle of appCandidates) {
+    const readDarwinBundleVersion = (appBundle) => {
       const infoPlist = path.join(appBundle, 'Contents', 'Info.plist');
-      if (!fs.existsSync(infoPlist)) continue;
+      if (!fs.existsSync(infoPlist)) return null;
       try {
         const xml = fs.readFileSync(infoPlist, 'utf8');
         const m = xml.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
-        if (m && m[1]) {
-          appVersion = m[1].trim();
-          break;
-        }
+        if (m && m[1]) return m[1].trim();
       } catch {}
-    }
+      return null;
+    };
+    const appCandidates = [
+      ...(allowStable
+        ? ['/Applications/Antigravity.app', path.join(home, 'Applications/Antigravity.app')]
+        : []),
+      ...(allowInsiders
+        ? ['/Applications/Antigravity - Insiders.app', path.join(home, 'Applications/Antigravity - Insiders.app')]
+        : [])
+    ];
     const launcherApp =
       channel === 'insiders'
         ? path.join(home, 'Applications', 'Antigravity - Insiders (Theme).app')
@@ -607,7 +802,9 @@ function readHostVersionAndProcesses(channel = 'auto') {
         ) {
           continue;
         }
-        const appMatch = cmd.match(/^(\/[^\r\n]*?\/Antigravity(?:\s-\sInsiders)?\.app)\/Contents\/MacOS\/(Antigravity(?:\s-\sInsiders)?)(?:\s|$)/);
+        const appMatch = cmd.match(
+          /^"?(\/[^\r\n"]*?\/Antigravity(?:\s-\sInsiders)?\.app)\/Contents\/MacOS\/(Antigravity(?:\s-\sInsiders)?)"?(?:\s|$)/
+        );
         if (!appMatch) continue;
         const ch = /Insiders/i.test(appMatch[2]) ? 'insiders' : 'stable';
         if ((ch === 'stable' && !allowStable) || (ch === 'insiders' && !allowInsiders)) continue;
@@ -621,36 +818,50 @@ function readHostVersionAndProcesses(channel = 'auto') {
         });
       }
     }
+    if (runningProcesses.length > 0) {
+      appVersion = pickMinDetectedHostVersion(
+        runningProcesses.map((proc) => (proc.appPath ? readDarwinBundleVersion(proc.appPath) : null))
+      );
+    }
+    if (!appVersion) {
+      appVersion = pickMinDetectedHostVersion(appCandidates.map((appBundle) => readDarwinBundleVersion(appBundle)));
+    }
   } else if (process.platform === 'win32') {
     const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
     const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
-    const exeCandidates =
-      channel === 'insiders'
-        ? [
-            path.join(localAppData, 'Programs', 'Antigravity - Insiders', 'Antigravity - Insiders.exe'),
-            path.join(progFiles, 'Antigravity - Insiders', 'Antigravity - Insiders.exe')
-          ]
-        : [
-            path.join(localAppData, 'Programs', 'Antigravity', 'Antigravity.exe'),
-            path.join(progFiles, 'Antigravity', 'Antigravity.exe'),
-            path.join(localAppData, 'Programs', 'Antigravity - Insiders', 'Antigravity - Insiders.exe')
-          ];
-    const existingExe = exeCandidates.find((p) => fs.existsSync(p)) || '';
+    const stableExeCandidates = allowStable
+      ? [
+          path.join(localAppData, 'Programs', 'Antigravity', 'Antigravity.exe'),
+          path.join(progFiles, 'Antigravity', 'Antigravity.exe')
+        ]
+      : [];
+    const insidersExeCandidates = allowInsiders
+      ? [
+          path.join(localAppData, 'Programs', 'Antigravity - Insiders', 'Antigravity - Insiders.exe'),
+          path.join(progFiles, 'Antigravity - Insiders', 'Antigravity - Insiders.exe')
+        ]
+      : [];
+    const existingStableExe = stableExeCandidates.find((p) => fs.existsSync(p)) || '';
+    const existingInsidersExe = insidersExeCandidates.find((p) => fs.existsSync(p)) || '';
+    const existingExes = [...stableExeCandidates, ...insidersExeCandidates].filter((p) => fs.existsSync(p));
+    const psExeList = existingExes.map((p) => `'${p.replace(/'/g, "''")}'`).join(', ');
     const psProbe = [
       `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`,
       `$ErrorActionPreference = 'SilentlyContinue'`,
       `$allowStable = $${allowStable ? 'true' : 'false'}`,
       `$allowInsiders = $${allowInsiders ? 'true' : 'false'}`,
-      `$ver = $null`,
-      existingExe ? `$ver = (Get-Item -LiteralPath '${existingExe.replace(/'/g, "''")}').VersionInfo.ProductVersion` : '',
+      `$staticVers = @()`,
+      existingExes.length > 0
+        ? `$staticVers = @(foreach ($ep in @(${psExeList})) { try { $sv = [string](Get-Item -LiteralPath $ep -ErrorAction Stop).VersionInfo.ProductVersion; if ($sv) { $sv } } catch {} })`
+        : '',
       `$procs = @()`,
-      `try { $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'Antigravity.exe' OR Name = 'Antigravity - Insiders.exe'" -ErrorAction Stop | Where-Object { $_.CommandLine -notmatch '--type=|--crashpad|--utility-sub-type=|--import=|sidecar_sdk|--ms-enable-electron-run-as-node' } | ForEach-Object { @{ pid = [int]$_.ProcessId; name = [string]$_.Name; exe = [string]$_.ExecutablePath; cmd = [string]$_.CommandLine } }) } catch {}`,
-      `if ($procs.Count -eq 0) { $byName = Get-Process -Name 'Antigravity','Antigravity - Insiders' -ErrorAction SilentlyContinue | Group-Object ProcessName; $procs = @(foreach ($g in $byName) { $p = ($g.Group | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1); if ($null -eq $p) { $p = $g.Group | Select-Object -First 1 }; if ($null -ne $p) { $exePath = ''; try { $exePath = [string]$p.Path } catch {}; @{ pid = [int]$p.Id; name = ([string]$p.ProcessName + '.exe'); exe = $exePath; cmd = '' } } }) }`,
+      `try { $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'Antigravity.exe' OR Name = 'Antigravity - Insiders.exe'" -ErrorAction Stop | Where-Object { $_.CommandLine -notmatch '--type=|--crashpad|--utility-sub-type=|--import=|sidecar_sdk|--ms-enable-electron-run-as-node' } | ForEach-Object { $ep = [string]$_.ExecutablePath; $pv = ''; if ($ep) { try { $pv = [string](Get-Item -LiteralPath $ep -ErrorAction Stop).VersionInfo.ProductVersion } catch {} }; @{ pid = [int]$_.ProcessId; name = [string]$_.Name; exe = $ep; ver = $pv; cmd = [string]$_.CommandLine } }) } catch {}`,
+      `if ($procs.Count -eq 0) { $byName = Get-Process -Name 'Antigravity','Antigravity - Insiders' -ErrorAction SilentlyContinue | Group-Object ProcessName; $procs = @(foreach ($g in $byName) { $p = ($g.Group | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1); if ($null -eq $p) { $p = $g.Group | Select-Object -First 1 }; if ($null -ne $p) { $exePath = ''; $pv = ''; try { $exePath = [string]$p.Path; if ($exePath) { $pv = [string](Get-Item -LiteralPath $exePath -ErrorAction Stop).VersionInfo.ProductVersion } } catch {}; @{ pid = [int]$p.Id; name = ([string]$p.ProcessName + '.exe'); exe = $exePath; ver = $pv; cmd = '' } } }) }`,
       `$lnkOk = $false`,
       `$wsh = New-Object -ComObject WScript.Shell`,
       ...buildWin32LnkSpecsPs(),
       `foreach ($spec in $lnkSpecs) { $dk = ([string]$spec.dir).ToLowerInvariant(); if ($seenLnkDirs.ContainsKey($dk)) { continue }; $seenLnkDirs[$dk] = $true; $items = if ($spec.recurse) { Get-ChildItem -LiteralPath $spec.dir -Filter '*.lnk' -File -Recurse -Depth $spec.depth -ErrorAction SilentlyContinue } else { Get-ChildItem -LiteralPath $spec.dir -Filter '*.lnk' -File -ErrorAction SilentlyContinue }; foreach ($item in $items) { try { $s = $wsh.CreateShortcut($item.FullName); $leaf = [IO.Path]::GetFileName([string]$s.TargetPath); $matchTarget = (($leaf -ieq 'Antigravity.exe' -and $allowStable) -or ($leaf -ieq 'Antigravity - Insiders.exe' -and $allowInsiders)); if ($matchTarget -and ($s.Arguments -match '--remote-debugging-port')) { $lnkOk = $true } } catch {} } }`,
-      `@{ appVersion = $ver; launcherInstalled = $lnkOk; procs = $procs } | ConvertTo-Json -Compress -Depth 4`
+      `@{ staticVers = $staticVers; launcherInstalled = $lnkOk; procs = $procs } | ConvertTo-Json -Compress -Depth 4`
     ]
       .filter(Boolean)
       .join('\n');
@@ -662,18 +873,21 @@ function readHostVersionAndProcesses(channel = 'auto') {
     if (r.status === 0 && r.stdout && r.stdout.trim()) {
       try {
         const info = JSON.parse(r.stdout.trim());
-        if (info.appVersion) appVersion = String(info.appVersion).trim();
         launcherInstalled = Boolean(info.launcherInstalled);
         const rawProcs = Array.isArray(info.procs) ? info.procs : info.procs ? [info.procs] : [];
+        const procVersions = [];
         runningProcesses = rawProcs
           .map((p) => {
             const ch = /insiders/i.test(p.name || p.exe || '') ? 'insiders' : 'stable';
             const cmd = String(p.cmd || '');
+            const exeVer = typeof p.ver === 'string' ? p.ver.trim() : '';
+            const fallbackExe = (ch === 'insiders' ? existingInsidersExe : existingStableExe) || existingExes[0] || '';
             return {
               pid: Number(p.pid) || 0,
               channel: ch,
               appPath: '',
-              exePath: String(p.exe || existingExe || ''),
+              exePath: String(p.exe || fallbackExe),
+              _exeVer: exeVer,
               cmd,
               hasCdpFlag: /--remote-debugging-port(?:=|\s|$)/i.test(cmd)
             };
@@ -681,39 +895,128 @@ function readHostVersionAndProcesses(channel = 'auto') {
           .filter(
             (p) =>
               p.pid > 0 && ((p.channel === 'stable' && allowStable) || (p.channel === 'insiders' && allowInsiders))
-          );
-        if (!appVersion && runningProcesses[0]?.exePath && fs.existsSync(runningProcesses[0].exePath)) {
-          const vRes = spawnSync(
-            'powershell',
-            [
-              '-NoProfile',
-              '-NonInteractive',
-              '-Command',
-              `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; (Get-Item -LiteralPath '${runningProcesses[0].exePath.replace(/'/g, "''")}').VersionInfo.ProductVersion`
-            ],
-            { windowsHide: true, encoding: 'utf8', timeout: 3000 }
-          );
-          if (vRes.status === 0 && vRes.stdout.trim()) appVersion = vRes.stdout.trim();
+          )
+          .map(({ _exeVer, ...rest }) => {
+            if (_exeVer) procVersions.push(_exeVer);
+            return rest;
+          });
+        appVersion = pickMinDetectedHostVersion(procVersions);
+        if (!appVersion) {
+          const rawStaticVers = Array.isArray(info.staticVers)
+            ? info.staticVers
+            : info.staticVers
+            ? [info.staticVers]
+            : [];
+          appVersion = pickMinDetectedHostVersion(rawStaticVers);
         }
       } catch {}
     }
   } else {
-    const desktopOverride = path.join(home, '.local', 'share', 'applications', 'antigravity.desktop');
-    launcherInstalled =
-      fs.existsSync(desktopOverride) && fs.readFileSync(desktopOverride, 'utf8').includes('--remote-debugging-port');
-    const pkgCandidates = ['/usr/share/antigravity/resources/app/package.json', '/opt/Antigravity/resources/app/package.json'];
-    for (const pkgPath of pkgCandidates) {
-      if (fs.existsSync(pkgPath)) {
+    const readLinuxPkgVersion = (pkgPath) => {
+      if (!pkgPath || !fs.existsSync(pkgPath)) return null;
+      try {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        if (pkg && typeof pkg.version === 'string' && pkg.version.trim()) {
+          return pkg.version.trim();
+        }
+      } catch {}
+      return null;
+    };
+    const resolveLinuxExecutablePath = (rawExe) => {
+      const token = String(rawExe || '').trim().replace(/\s+\(deleted\)$/, '');
+      if (!token) return '';
+      if (token.startsWith('/')) return token;
+      if (token.includes('/')) return '';
+      const pathDirs = [
+        ...String(process.env.PATH || '').split(':'),
+        path.join(home, '.local', 'bin'),
+        '/usr/local/bin',
+        '/usr/bin',
+        '/bin',
+        '/snap/bin'
+      ];
+      for (const dir of pathDirs) {
+        if (!dir) continue;
+        const cand = path.join(dir, token);
+        if (fs.existsSync(cand)) return cand;
+      }
+      return '';
+    };
+    const probeLinuxAppVersionFromExecutable = (rawExe) => {
+      const exe = resolveLinuxExecutablePath(rawExe);
+      if (!exe || !exe.startsWith('/')) return null;
+      let realExe = exe;
+      try {
+        if (fs.existsSync(exe)) realExe = fs.realpathSync(exe);
+      } catch {}
+      const isIns = /insiders/i.test(exe) || /insiders/i.test(realExe);
+      const appFolder = isIns ? 'antigravity-insiders' : 'antigravity';
+      const dirsToCheck = Array.from(new Set([path.dirname(realExe), path.dirname(exe)]));
+      for (const baseDir of dirsToCheck) {
+        const relCandidates = [
+          path.join(baseDir, 'resources', 'app', 'package.json'),
+          path.join(baseDir, '..', 'resources', 'app', 'package.json'),
+          path.join(baseDir, '..', 'share', appFolder, 'resources', 'app', 'package.json'),
+          path.join(baseDir, '..', 'lib', appFolder, 'resources', 'app', 'package.json')
+        ];
+        for (const cand of relCandidates) {
+          const ver = readLinuxPkgVersion(cand);
+          if (ver) return ver;
+        }
+      }
+      return null;
+    };
+    const userAppsDir = path.join(home, '.local', 'share', 'applications');
+    const desktopNames = [
+      allowStable ? 'antigravity.desktop' : null,
+      allowInsiders ? 'antigravity-insiders.desktop' : null
+    ].filter(Boolean);
+    launcherInstalled = desktopNames.some((name) => {
+      const p = path.join(userAppsDir, name);
+      try {
+        return fs.existsSync(p) && fs.readFileSync(p, 'utf8').includes('--remote-debugging-port');
+      } catch {
+        return false;
+      }
+    });
+    const probeLinuxChannelStaticVersions = (ch) => {
+      const isIns = ch === 'insiders';
+      const pkgPaths = isIns
+        ? [
+            '/usr/share/antigravity-insiders/resources/app/package.json',
+            '/opt/Antigravity - Insiders/resources/app/package.json',
+            '/opt/Antigravity-Insiders/resources/app/package.json',
+            '/opt/antigravity-insiders/resources/app/package.json'
+          ]
+        : [
+            '/usr/share/antigravity/resources/app/package.json',
+            '/opt/Antigravity/resources/app/package.json',
+            '/opt/antigravity/resources/app/package.json'
+          ];
+      const found = [];
+      for (const pkgPath of pkgPaths) {
+        const ver = readLinuxPkgVersion(pkgPath);
+        if (ver) found.push(ver);
+      }
+      if (found.length > 0) return found;
+      const desktopName = isIns ? 'antigravity-insiders.desktop' : 'antigravity.desktop';
+      for (const dir of [userAppsDir, '/usr/share/applications']) {
+        const dp = path.join(dir, desktopName);
+        if (!fs.existsSync(dp)) continue;
         try {
-          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-          if (pkg.version) {
-            appVersion = String(pkg.version);
+          const raw = fs.readFileSync(dp, 'utf8');
+          const execBin = extractLinuxDesktopExecBinary(raw);
+          const ver = probeLinuxAppVersionFromExecutable(execBin);
+          if (ver) {
+            found.push(ver);
             break;
           }
         } catch {}
       }
-    }
+      return found;
+    };
     const ps = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', timeout: 2500 });
+    const procVersions = [];
     if (ps.status === 0 && ps.stdout) {
       for (const line of String(ps.stdout).split(/\r?\n/)) {
         const m = line.trim().match(/^(\d+)\s+(.+)$/);
@@ -728,19 +1031,47 @@ function readHostVersionAndProcesses(channel = 'auto') {
         ) {
           continue;
         }
-        const binMatch = cmd.match(/^(\/\S*\/antigravity(?:-insiders)?)(?:\s|$)/i);
-        if (!binMatch) continue;
-        const ch = /insiders/i.test(binMatch[1]) ? 'insiders' : 'stable';
+        const binMatch = cmd.match(
+          /^(?:"((?:[^"\r\n]*\/)?antigravity(?:-insiders)?)"|'((?:[^'\r\n]*\/)?antigravity(?:-insiders)?)'|(\/(?:[^\s"']|\s-\sinsiders)*\/antigravity(?:-insiders)?)|(antigravity(?:-insiders)?))(?=\s+(?!-\s*insiders(?:\/|\s|$))|$)/i
+        );
+        let matchedExe = binMatch ? binMatch[1] || binMatch[2] || binMatch[3] || binMatch[4] || '' : '';
+        let procLinkExe = '';
+        if (typeof fs.readlinkSync === 'function') {
+          try {
+            const linkTarget = String(fs.readlinkSync(`/proc/${pid}/exe`) || '').replace(/\s+\(deleted\)$/, '');
+            if (/\/antigravity(?:-insiders)?$/i.test(linkTarget)) {
+              procLinkExe = linkTarget;
+              if (!matchedExe) matchedExe = linkTarget;
+            }
+          } catch {}
+        }
+        if (!matchedExe) continue;
+        const resolvedExe = resolveLinuxExecutablePath(procLinkExe || matchedExe) || procLinkExe || matchedExe;
+        const ch = /insiders/i.test(procLinkExe || resolvedExe || matchedExe) ? 'insiders' : 'stable';
         if ((ch === 'stable' && !allowStable) || (ch === 'insiders' && !allowInsiders)) continue;
         runningProcesses.push({
           pid,
           channel: ch,
           appPath: '',
-          exePath: binMatch[1],
+          exePath: resolvedExe,
           cmd,
           hasCdpFlag: /--remote-debugging-port(?:=|\s|$)/.test(cmd)
         });
+        const procVer =
+          probeLinuxAppVersionFromExecutable(procLinkExe || resolvedExe || matchedExe) ||
+          pickMinDetectedHostVersion(probeLinuxChannelStaticVersions(ch));
+        if (procVer) procVersions.push(procVer);
       }
+    }
+    if (procVersions.length > 0) {
+      appVersion = pickMinDetectedHostVersion(procVersions);
+    }
+    if (!appVersion) {
+      const staticVers = [
+        ...(allowStable ? probeLinuxChannelStaticVersions('stable') : []),
+        ...(allowInsiders ? probeLinuxChannelStaticVersions('insiders') : [])
+      ];
+      appVersion = pickMinDetectedHostVersion(staticVers);
     }
   }
 
@@ -872,23 +1203,46 @@ async function detectEnvironment(channel = 'auto') {
     const appDirName = isInsiders ? 'Antigravity - Insiders' : 'Antigravity';
     const dotDir = path.join(home, isInsiders ? '.antigravity-insiders' : '.antigravity');
     let portFile;
-    let appPath;
+    let appPaths = [];
+    let winExePaths = [];
     if (process.platform === 'darwin') {
       portFile = path.join(home, 'Library/Application Support', appDirName, 'DevToolsActivePort');
-      appPath = isInsiders ? '/Applications/Antigravity - Insiders.app' : '/Applications/Antigravity.app';
+      const bundleName = isInsiders ? 'Antigravity - Insiders.app' : 'Antigravity.app';
+      appPaths = [path.join('/Applications', bundleName), path.join(home, 'Applications', bundleName)];
     } else if (process.platform === 'win32') {
       const appData = process.env.APPDATA || path.join(home, 'AppData/Roaming');
       portFile = path.join(appData, appDirName, 'DevToolsActivePort');
-      appPath = '';
+      const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+      const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
+      const exeName = isInsiders ? 'Antigravity - Insiders.exe' : 'Antigravity.exe';
+      winExePaths = [
+        path.join(localAppData, 'Programs', appDirName, exeName),
+        path.join(progFiles, appDirName, exeName)
+      ];
     } else {
       const xdg = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
       portFile = path.join(xdg, appDirName, 'DevToolsActivePort');
-      appPath = '';
     }
+    const linuxInstallDirs =
+      process.platform !== 'darwin' && process.platform !== 'win32'
+        ? isInsiders
+          ? [
+              '/usr/share/antigravity-insiders',
+              '/opt/Antigravity - Insiders',
+              '/opt/Antigravity-Insiders',
+              '/opt/antigravity-insiders'
+            ]
+          : ['/usr/share/antigravity', '/opt/Antigravity', '/opt/antigravity']
+        : [];
     const portFileExists = fs.existsSync(portFile);
-    const appExists = appPath
-      ? fs.existsSync(appPath)
-      : portFileExists || fs.existsSync(path.dirname(portFile)) || fs.existsSync(dotDir);
+    const appExists =
+      appPaths.length > 0
+        ? appPaths.some((p) => fs.existsSync(p)) || portFileExists
+        : portFileExists ||
+          fs.existsSync(path.dirname(portFile)) ||
+          fs.existsSync(dotDir) ||
+          winExePaths.some((p) => fs.existsSync(p)) ||
+          linuxInstallDirs.some((d) => fs.existsSync(d));
     return {
       channel: ch,
       appExists,
@@ -928,7 +1282,17 @@ async function detectEnvironment(channel = 'auto') {
   const activeRunningChannel = hostRuntime.runningProcesses[0]?.channel || primaryChannel;
   const preferredPortFile =
     channelsMap[activeRunningChannel]?.portFile ||
-    (chInfo.portFileExists ? chInfo.portFile : insidersInfo.portFileExists ? insidersInfo.portFile : chInfo.portFile);
+    (chInfo.portFileExists
+      ? chInfo.portFile
+      : channel !== 'stable' && insidersInfo.portFileExists
+      ? insidersInfo.portFile
+      : chInfo.portFile);
+  const channelAppExists =
+    channel === 'stable'
+      ? stableInfo.appExists
+      : channel === 'insiders'
+      ? insidersInfo.appExists
+      : stableInfo.appExists || insidersInfo.appExists;
 
   return {
     nodeVer,
@@ -953,7 +1317,7 @@ async function detectEnvironment(channel = 'auto') {
     unregisteredWinFonts,
     winUserFontsDir,
     channel,
-    appExists: chInfo.appExists || insidersInfo.appExists || hostRuntime.runningProcesses.length > 0,
+    appExists: channelAppExists || hostRuntime.runningProcesses.length > 0,
     appVersion: hostRuntime.appVersion,
     cdpStatus,
     launcherInstalled: hostRuntime.launcherInstalled,
@@ -1095,82 +1459,192 @@ function ensureArgvRemoteDebugging(channel = 'auto') {
   return results;
 }
 
-function isAllowedOrigin(urlStr) {
+function isAllowedOrigin(urlStr, extraOrigins = null) {
   if (!urlStr || typeof urlStr !== 'string') return false;
-  return ALLOWED_ORIGINS.some((prefix) => urlStr.startsWith(prefix));
+  if (ALLOWED_ORIGINS.some((prefix) => urlStr.startsWith(prefix))) return true;
+  if (Array.isArray(extraOrigins)) {
+    return extraOrigins.some((prefix) => typeof prefix === 'string' && prefix && urlStr.startsWith(prefix));
+  }
+  return false;
 }
 
-function fetchTargetsFromPort(port) {
+function isExternalNonHostBrowserProduct(browserStr, userAgentStr = '') {
+  const b = String(browserStr || '').trim();
+  const ua = String(userAgentStr || '').trim();
+  if (!b && !ua) return false;
+  if (/electron|antigravity/i.test(b) || /electron\/|antigravity\//i.test(ua)) return false;
+  return /^(?:Headless)?Chrome\/|^Chromium\/|^Edg(?:e|A|iOS)?\/|^Brave\/|^Firefox\/|^OPR\/|^Vivaldi\//i.test(b);
+}
+
+function fetchBrowserVersionFromPort(port) {
   return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port, path: '/json/list', timeout: 450 }, (res) => {
+    let settled = false;
+    const done = (val) => {
+      if (!settled) {
+        settled = true;
+        resolve(val);
+      }
+    };
+    const req = http.get({ host: '127.0.0.1', port, path: '/json/version', timeout: 450 }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        done({ externalBrowser: false });
+        return;
+      }
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => {
         try {
-          resolve(JSON.parse(data));
+          const parsed = JSON.parse(data);
+          done({
+            externalBrowser: isExternalNonHostBrowserProduct(parsed?.Browser, parsed?.['User-Agent'])
+          });
         } catch {
-          resolve([]);
+          done({ externalBrowser: false });
         }
       });
+      res.on('error', () => done({ externalBrowser: false }));
     });
-    req.on('error', () => resolve([]));
+    req.on('error', () => done({ externalBrowser: false }));
     req.on('timeout', () => {
       req.destroy();
-      resolve([]);
+      done({ externalBrowser: false });
     });
   });
 }
 
-async function inspectLiveWindow(portFileOrEnv, fallbackPort = 9222) {
-  const candidateFiles = [];
-  const candidatePorts = [];
+function fetchTargetsFromPort(port) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (val) => {
+      if (!settled) {
+        settled = true;
+        resolve(val);
+      }
+    };
+    const req = http.get({ host: '127.0.0.1', port, path: '/json/list', timeout: 450 }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        done({ reachable: false, targets: [] });
+        return;
+      }
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          done(Array.isArray(parsed) ? { reachable: true, targets: parsed } : { reachable: false, targets: [] });
+        } catch {
+          done({ reachable: false, targets: [] });
+        }
+      });
+      res.on('error', () => done({ reachable: false, targets: [] }));
+    });
+    req.on('error', () => done({ reachable: false, targets: [] }));
+    req.on('timeout', () => {
+      req.destroy();
+      done({ reachable: false, targets: [] });
+    });
+  });
+}
+
+async function inspectLiveWindow(portFileOrEnv, fallbackPort = 9222, extraAllowedOrigins = null) {
+  const channelSpecs = [];
 
   if (portFileOrEnv && typeof portFileOrEnv === 'object' && portFileOrEnv.channels) {
-    if (portFileOrEnv.portFile) candidateFiles.push(portFileOrEnv.portFile);
-    if (portFileOrEnv.channels.stable?.portFile) candidateFiles.push(portFileOrEnv.channels.stable.portFile);
-    if (portFileOrEnv.channels.insiders?.portFile) candidateFiles.push(portFileOrEnv.channels.insiders.portFile);
-    if (portFileOrEnv.channels.stable?.appExists !== false) candidatePorts.push(9222);
-    if (portFileOrEnv.channels.insiders?.appExists) candidatePorts.push(9223);
+    const reqCh = portFileOrEnv.channel || 'auto';
+    const allowStable = reqCh !== 'insiders';
+    const allowInsiders = reqCh !== 'stable';
+    const stableSpec = allowStable
+      ? {
+          portFile: portFileOrEnv.channels.stable?.portFile || '',
+          fallbackPort: portFileOrEnv.channels.stable?.appExists !== false ? 9222 : 0
+        }
+      : null;
+    const insidersSpec = allowInsiders
+      ? {
+          portFile: portFileOrEnv.channels.insiders?.portFile || '',
+          fallbackPort: reqCh === 'insiders' || portFileOrEnv.channels.insiders?.appExists ? 9223 : 0
+        }
+      : null;
+    const preferInsidersFirst =
+      allowInsiders &&
+      Boolean(
+        portFileOrEnv.portFile &&
+          insidersSpec?.portFile &&
+          portFileOrEnv.portFile === insidersSpec.portFile
+      );
+    if (preferInsidersFirst) {
+      if (insidersSpec) channelSpecs.push(insidersSpec);
+      if (stableSpec) channelSpecs.push(stableSpec);
+    } else {
+      if (stableSpec) channelSpecs.push(stableSpec);
+      if (insidersSpec) channelSpecs.push(insidersSpec);
+    }
+    if (
+      portFileOrEnv.portFile &&
+      portFileOrEnv.portFile !== stableSpec?.portFile &&
+      portFileOrEnv.portFile !== insidersSpec?.portFile &&
+      allowStable &&
+      allowInsiders
+    ) {
+      channelSpecs.unshift({ portFile: portFileOrEnv.portFile, fallbackPort: 0 });
+    }
   } else if (typeof portFileOrEnv === 'string' && portFileOrEnv) {
-    candidateFiles.push(portFileOrEnv);
-    if (fallbackPort > 0) candidatePorts.push(fallbackPort);
+    channelSpecs.push({ portFile: portFileOrEnv, fallbackPort: fallbackPort > 0 ? fallbackPort : 0 });
   } else if (fallbackPort > 0) {
-    candidatePorts.push(fallbackPort);
+    channelSpecs.push({ portFile: '', fallbackPort });
   }
 
-  let port = null;
-  let targets = [];
+  let firstRespondedPort = null;
+  const targets = [];
+  const seenTargetIds = new Set();
   const triedPorts = new Set();
 
-  for (const pf of candidateFiles) {
-    if (pf && fs.existsSync(pf)) {
-      const raw = fs.readFileSync(pf, 'utf8').trim();
+  const appendPortTargets = (portNum, list) => {
+    if (!firstRespondedPort) firstRespondedPort = portNum;
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const tid = String(item.id || '');
+      const dedupeKey = tid ? `${portNum}:${tid}` : `${portNum}:${targets.length}`;
+      if (seenTargetIds.has(dedupeKey)) continue;
+      seenTargetIds.add(dedupeKey);
+      targets.push({ ...item, _cdpPort: portNum });
+    }
+  };
+
+  for (const spec of channelSpecs) {
+    let channelPortFound = false;
+    if (spec.portFile && fs.existsSync(spec.portFile)) {
+      let raw = '';
+      try {
+        raw = fs.readFileSync(spec.portFile, 'utf8').trim();
+      } catch {}
       const parsed = parseInt(raw.split(/\r?\n/)[0], 10);
       if (parsed > 0 && !triedPorts.has(parsed)) {
         triedPorts.add(parsed);
         const res = await fetchTargetsFromPort(parsed);
-        if (res.length > 0) {
-          port = parsed;
-          targets = res;
-          break;
+        if (res.reachable) {
+          const verInfo = await fetchBrowserVersionFromPort(parsed);
+          if (!verInfo.externalBrowser) {
+            appendPortTargets(parsed, res.targets);
+            channelPortFound = true;
+          }
+        }
+      }
+    }
+    if (!channelPortFound && spec.fallbackPort > 0 && !triedPorts.has(spec.fallbackPort)) {
+      triedPorts.add(spec.fallbackPort);
+      const fbRes = await fetchTargetsFromPort(spec.fallbackPort);
+      if (fbRes.reachable) {
+        const verInfo = await fetchBrowserVersionFromPort(spec.fallbackPort);
+        if (!verInfo.externalBrowser) {
+          appendPortTargets(spec.fallbackPort, fbRes.targets);
         }
       }
     }
   }
-  if (targets.length === 0) {
-    for (const fb of candidatePorts) {
-      if (fb > 0 && !triedPorts.has(fb)) {
-        triedPorts.add(fb);
-        const fbTargets = await fetchTargetsFromPort(fb);
-        if (fbTargets.length > 0) {
-          port = fb;
-          targets = fbTargets;
-          break;
-        }
-      }
-    }
-  }
-  if (!port || targets.length === 0) {
+  if (!firstRespondedPort) {
     return { reachable: false, reason: 'No active CDP port responded (checked DevToolsActivePort & fallback port 9222)' };
   }
 
@@ -1179,12 +1653,12 @@ async function inspectLiveWindow(portFileOrEnv, fallbackPort = 9222) {
       t.type === 'page' &&
       t.webSocketDebuggerUrl &&
       !String(t.url || '').startsWith('devtools://') &&
-      isAllowedOrigin(t.url) &&
+      isAllowedOrigin(t.url, extraAllowedOrigins) &&
       !String(t.title || '').includes('Launchpad')
   );
 
   if (pages.length === 0) {
-    return { reachable: true, port, pages: 0, reason: 'No active workbench page target' };
+    return { reachable: true, port: firstRespondedPort, pages: 0, reason: 'No active workbench page target' };
   }
 
   const evaluatePageState = (candidate) =>
@@ -1257,13 +1731,23 @@ async function inspectLiveWindow(portFileOrEnv, fallbackPort = 9222) {
 
   let selected = null;
   let firstHostCandidate = null;
-  let firstNullCandidate = null;
+  let firstHostNullCandidate = null;
+  const hostTargets = [];
+
+  const isLikelyHostWhenTimedOut = (cand) => {
+    const u = String(cand?.url || '');
+    const t = String(cand?.title || '');
+    return u.startsWith('vscode-file://') || u.startsWith('plugin://swarm--') || /\bAntigravity\b/i.test(t);
+  };
 
   for (const candidate of pages) {
     const rawState = await evaluatePageState(candidate);
     if (rawState === null) {
-      if (!firstNullCandidate) {
-        firstNullCandidate = { page: candidate, state: null };
+      if (isLikelyHostWhenTimedOut(candidate)) {
+        hostTargets.push({ targetId: candidate.id, port: candidate._cdpPort || firstRespondedPort, title: candidate.title, state: null });
+        if (!firstHostNullCandidate) {
+          firstHostNullCandidate = { page: candidate, state: null };
+        }
       }
       continue;
     }
@@ -1271,9 +1755,9 @@ async function inspectLiveWindow(portFileOrEnv, fallbackPort = 9222) {
     const cleanState = { ...rawState };
     delete cleanState.__isHost;
     if (isHost) {
-      if (cleanState.hasStyle === true) {
+      hostTargets.push({ targetId: candidate.id, port: candidate._cdpPort || firstRespondedPort, title: candidate.title, state: cleanState });
+      if (!selected && cleanState.hasStyle === true) {
         selected = { page: candidate, state: cleanState };
-        break;
       }
       if (!firstHostCandidate) {
         firstHostCandidate = { page: candidate, state: cleanState };
@@ -1282,18 +1766,19 @@ async function inspectLiveWindow(portFileOrEnv, fallbackPort = 9222) {
   }
 
   if (!selected) {
-    selected = firstHostCandidate || firstNullCandidate;
+    selected = firstHostCandidate || firstHostNullCandidate;
   }
   if (!selected) {
-    return { reachable: true, port, pages: 0, reason: 'No active workbench page target' };
+    return { reachable: true, port: firstRespondedPort, pages: 0, reason: 'No active workbench page target' };
   }
 
   return {
     reachable: true,
-    port,
+    port: selected.page._cdpPort || firstRespondedPort,
     targetId: selected.page.id,
     title: selected.page.title,
-    state: selected.state
+    state: selected.state,
+    ...(hostTargets.length > 1 ? { hostTargets } : {})
   };
 }
 
@@ -1830,16 +2315,16 @@ function inspectSourceSync(sourceDir, targetDir) {
 }
 
 async function runDoctor() {
-  const channel = getArg('--channel', 'auto');
   const defaultTarget = resolveGlobalInstallDir();
   const targetDir = path.resolve(getArg('--target-dir', resolveDefaultTargetDir()));
+  const channel = readTargetConfiguredChannel(targetDir);
   const isCustomSandboxTarget =
     hasFlag('--target-dir') && !isSameTargetPath(targetDir, defaultTarget) && !hasFlag('--register-service');
 
   const env = await detectEnvironment(channel);
   const integrity = verifyCoreIntegrity(targetDir);
   const sourceSync = inspectSourceSync(__dirname, targetDir);
-  const live = await inspectLiveWindow(env);
+  const live = await inspectLiveWindow(env, 9222, readTargetAllowedOrigins(targetDir));
 
   const cdpMissingFlag = !isCustomSandboxTarget && !live.reachable && env.cdpStatus === 'missing_opt_in_flag';
   const remediation = cdpMissingFlag ? `node ${JSON.stringify(path.join(targetDir, 'install.mjs'))} relaunch` : null;
@@ -2253,7 +2738,8 @@ WantedBy=default.target
     fs.writeFileSync(serviceFile, unitContent, 'utf8');
     try {
       execSync(
-        'systemctl --user daemon-reload && (systemctl --user enable antigravity-theme.service 2>/dev/null || true) && systemctl --user restart antigravity-theme.service 2>/dev/null || true'
+        'systemctl --user daemon-reload 2>/dev/null && (systemctl --user enable antigravity-theme.service 2>/dev/null || true) && (systemctl --user reset-failed antigravity-theme.service 2>/dev/null || true) && systemctl --user restart antigravity-theme.service 2>/dev/null || true',
+        { stdio: 'ignore' }
       );
     } catch {}
     return { platform: 'linux', serviceFile, runningNow: true };
@@ -2521,6 +3007,7 @@ WantedBy=default.target
 
 async function runInstall() {
   const cliChannel = getArg('--channel', null);
+  const preserveUserChannel = hasFlag('--preserve-user-channel');
   const channel = cliChannel || 'auto';
   const preset = getArg('--preset', null);
   const darkPreset = getArg('--dark-preset', null);
@@ -2556,7 +3043,9 @@ async function runInstall() {
     process.exit(1);
   }
 
-  buildManifest(__dirname);
+  if (!verifyCoreIntegrity(__dirname).ok) {
+    buildManifest(__dirname);
+  }
 
   const srcCore = path.join(__dirname, 'core');
   const srcUser = path.join(__dirname, 'user');
@@ -2585,6 +3074,19 @@ async function runInstall() {
       fs.rmSync(targetPrev, { recursive: true, force: true });
       copyDirRecursive(targetCore, targetPrev);
       backupCreated = stampedBackupDir;
+      try {
+        const coreBackupStamps = fs
+          .readdirSync(backupsDir, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && /^\d{4}-\d{2}-\d{2}T/.test(entry.name) && !entry.name.endsWith('-user'))
+          .map((entry) => entry.name)
+          .sort()
+          .reverse();
+        for (const oldStamp of coreBackupStamps.slice(8)) {
+          try {
+            fs.rmSync(path.join(backupsDir, oldStamp), { recursive: true, force: true });
+          } catch {}
+        }
+      } catch {}
     } else if (fs.existsSync(targetCore) && !fs.existsSync(targetPrev)) {
       copyDirRecursive(targetCore, targetPrev);
       backupCreated = targetPrev;
@@ -2622,11 +3124,14 @@ async function runInstall() {
   const userConfigPath = path.join(targetUser, 'config.json');
   let currentCfg = {};
   let canWriteUserCfg = true;
-  if (fs.existsSync(userConfigPath)) {
+  const prevCfgRaw = fs.existsSync(userConfigPath) ? fs.readFileSync(userConfigPath, 'utf8') : null;
+  let preMutateCfgJson = null;
+  if (prevCfgRaw !== null) {
     try {
-      const parsed = JSON.parse(fs.readFileSync(userConfigPath, 'utf8').replace(/^\uFEFF/, ''));
+      const parsed = JSON.parse(prevCfgRaw.replace(/^\uFEFF/, ''));
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         currentCfg = parsed;
+        preMutateCfgJson = JSON.stringify(currentCfg);
       } else {
         canWriteUserCfg = false;
       }
@@ -2636,7 +3141,7 @@ async function runInstall() {
     }
   }
   if (typeof currentCfg.enabled !== 'boolean') currentCfg.enabled = true;
-  if (cliChannel) {
+  if (cliChannel && !preserveUserChannel) {
     currentCfg.channel = cliChannel;
   } else if (!currentCfg.channel) {
     currentCfg.channel = 'auto';
@@ -2651,7 +3156,9 @@ async function runInstall() {
   } else if (!currentCfg.darkPreset) {
     currentCfg.darkPreset = 'onyx';
   }
-  currentCfg.installedLocale = 'zh-CN';
+  if (syncUser || currentCfg.installedLocale !== 'none') {
+    currentCfg.installedLocale = 'zh-CN';
+  }
   if ('fontMode' in currentCfg) {
     delete currentCfg.fontMode;
   }
@@ -2692,7 +3199,12 @@ async function runInstall() {
     }
   }
   if (canWriteUserCfg) {
-    fs.writeFileSync(userConfigPath, JSON.stringify(currentCfg, null, 2) + '\n', 'utf8');
+    const postMutateCfgJson = JSON.stringify(currentCfg);
+    const nextCfgJson = JSON.stringify(currentCfg, null, 2) + '\n';
+    const semanticallyUnchanged = !syncUser && preMutateCfgJson !== null && postMutateCfgJson === preMutateCfgJson;
+    if (!semanticallyUnchanged && (prevCfgRaw === null || prevCfgRaw.replace(/^\uFEFF/, '') !== nextCfgJson)) {
+      fs.writeFileSync(userConfigPath, nextCfgJson, 'utf8');
+    }
   }
 
   const realDaemon = path.join(targetCore, 'daemon.mjs');
@@ -2720,13 +3232,23 @@ async function runInstall() {
     serviceInfo = registerSystemService(targetDir, wrapperDaemon);
 
     // 立即执行一次 --once 同步注入
-    spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', realDaemon, '--once'], {
+    const onceArgs = ['--disable-warning=ExperimentalWarning', realDaemon, '--once'];
+    if (cliChannel === 'stable' || cliChannel === 'insiders' || cliChannel === 'auto') {
+      onceArgs.push('--channel', cliChannel);
+    }
+    spawnSync(process.execPath, onceArgs, {
       stdio: 'inherit'
     });
   }
 
-  const postEnv = isCustomSandboxTarget ? env : await detectEnvironment(currentCfg.channel);
-  const live = isCustomSandboxTarget ? { skipped: true, reason: 'custom-target-dir' } : await inspectLiveWindow(postEnv);
+  const effectivePostChannel =
+    cliChannel === 'stable' || cliChannel === 'insiders' || cliChannel === 'auto'
+      ? cliChannel
+      : currentCfg.channel;
+  const postEnv = isCustomSandboxTarget ? env : await detectEnvironment(effectivePostChannel);
+  const live = isCustomSandboxTarget
+    ? { skipped: true, reason: 'custom-target-dir' }
+    : await inspectLiveWindow(postEnv, 9222, Array.isArray(currentCfg.allowedOrigins) ? currentCfg.allowedOrigins : null);
   const fontsReport = buildFontReport(postEnv);
   const needsCdpRelaunch =
     !isCustomSandboxTarget && !live.reachable && postEnv.cdpStatus === 'missing_opt_in_flag';
@@ -3310,7 +3832,9 @@ async function runRelaunch() {
     if (process.platform === 'darwin') {
       const appPath =
         channel === 'insiders'
-          ? '/Applications/Antigravity - Insiders.app'
+          ? ['/Applications/Antigravity - Insiders.app', path.join(home, 'Applications/Antigravity - Insiders.app')].find(
+              (p) => fs.existsSync(p)
+            ) || '/Applications/Antigravity - Insiders.app'
           : ['/Applications/Antigravity.app', path.join(home, 'Applications/Antigravity.app')].find((p) =>
               fs.existsSync(p)
             ) || '/Applications/Antigravity.app';
@@ -3429,24 +3953,61 @@ async function runRelaunch() {
 
 async function runVerify() {
   const safeMode = hasFlag('--safe-mode');
-  const channel = getArg('--channel', 'auto');
+  const cliChannel = getArg('--channel', null);
   const targetDir = path.resolve(getArg('--target-dir', resolveDefaultTargetDir()));
+  const channel = safeMode
+    ? cliChannel === 'stable' || cliChannel === 'insiders' || cliChannel === 'auto'
+      ? cliChannel
+      : 'auto'
+    : readTargetConfiguredChannel(targetDir);
+  const expectedEnabled = safeMode ? true : readTargetPatchEnabled(targetDir);
   const daemonPath = path.join(targetDir, 'core', 'daemon.mjs');
 
   const daemonArgs = ['--disable-warning=ExperimentalWarning', daemonPath, '--once'];
   if (safeMode) daemonArgs.push('--safe-mode');
-  if (channel && channel !== 'auto') daemonArgs.push('--channel', channel);
+  if (cliChannel === 'stable' || cliChannel === 'insiders' || cliChannel === 'auto') {
+    daemonArgs.push('--channel', cliChannel);
+  }
 
-  spawnSync(process.execPath, daemonArgs, { stdio: 'inherit' });
+  const daemonRes = spawnSync(process.execPath, daemonArgs, { encoding: 'utf8', windowsHide: true });
+  if (daemonRes.stdout) process.stderr.write(daemonRes.stdout);
+  if (daemonRes.stderr) process.stderr.write(daemonRes.stderr);
+  const installedManifest = readInstalledCoreManifest(targetDir);
+  const installedSemver =
+    installedManifest && typeof installedManifest.version === 'string' && installedManifest.version.trim()
+      ? installedManifest.version.trim().replace(/^v/i, '')
+      : '';
+  const escapedInstalledSemver = installedSemver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const installedSemverRe = escapedInstalledSemver
+    ? new RegExp(`(?:^|[^0-9.])v?${escapedInstalledSemver}(?:$|[^0-9.])`, 'i')
+    : null;
 
   const env = await detectEnvironment(channel);
-  const live = await inspectLiveWindow(env);
+  const live = await inspectLiveWindow(env, 9222, safeMode ? null : readTargetAllowedOrigins(targetDir));
   const fontsReport = buildFontReport(env);
-  const ok = Boolean(live.reachable && (live.state?.hasStyle || live.pages === 0));
+  const candidateStates =
+    Array.isArray(live.hostTargets) && live.hostTargets.length > 0
+      ? live.hostTargets.map((h) => h.state)
+      : [live.state];
+  const isStateConsistent = (st) => {
+    if (!st || typeof st !== 'object') return false;
+    const ver = typeof st.version === 'string' ? st.version.trim() : '';
+    if (!ver) return false;
+    if (installedSemverRe && !installedSemverRe.test(ver)) return false;
+    return expectedEnabled
+      ? Boolean(st.hasStyle && !ver.endsWith('-disabled'))
+      : Boolean(!st.hasStyle && ver.endsWith('-disabled'));
+  };
+  const ok = Boolean(
+    daemonRes.status === 0 &&
+      live.reachable &&
+      (live.pages === 0 || (candidateStates.length > 0 && candidateStates.every(isStateConsistent)))
+  );
   console.log(
     JSON.stringify(
       {
         ok,
+        enabled: expectedEnabled,
         version: live.state?.version || null,
         themeStyle: Boolean(live.state?.hasStyle),
         safeMode,
@@ -3476,18 +4037,47 @@ async function runRollback() {
 
   const isValidCoreBackup = (dir) =>
     fs.existsSync(path.join(dir, 'daemon.mjs')) && fs.existsSync(path.join(dir, 'runtime.js'));
+  const isVerifiedCoreBackup = (dir) =>
+    isValidCoreBackup(dir) && verifyCoreIntegrity(dir, { coreDir: dir }).ok;
+
+  const isIsoStampDir = (name) => /^\d{4}-\d{2}-\d{2}T/.test(name);
+  const backupStampsNewestFirst = fs.existsSync(backupsDir)
+    ? fs
+        .readdirSync(backupsDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.name.endsWith('-user'))
+        .map((entry) => entry.name)
+        .sort((a, b) => {
+          const aIso = isIsoStampDir(a);
+          const bIso = isIsoStampDir(b);
+          if (aIso !== bIso) return aIso ? -1 : 1;
+          return b.localeCompare(a);
+        })
+    : [];
 
   let restoreSource = null;
-  if (isValidCoreBackup(targetPrev)) {
+  if (isVerifiedCoreBackup(targetPrev)) {
     restoreSource = targetPrev;
-  } else if (fs.existsSync(backupsDir)) {
-    const stamps = fs
-      .readdirSync(backupsDir)
-      .filter((name) => !name.endsWith('-user') && isValidCoreBackup(path.join(backupsDir, name)))
-      .sort()
-      .reverse();
-    if (stamps.length > 0) {
-      restoreSource = path.join(backupsDir, stamps[0]);
+  } else {
+    for (const name of backupStampsNewestFirst) {
+      const candidate = path.join(backupsDir, name);
+      if (isVerifiedCoreBackup(candidate)) {
+        restoreSource = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!restoreSource) {
+    if (isValidCoreBackup(targetPrev)) {
+      restoreSource = targetPrev;
+    } else {
+      for (const name of backupStampsNewestFirst) {
+        const candidate = path.join(backupsDir, name);
+        if (isValidCoreBackup(candidate)) {
+          restoreSource = candidate;
+          break;
+        }
+      }
     }
   }
 
@@ -3496,24 +4086,34 @@ async function runRollback() {
     process.exit(1);
   }
 
+  if (!isCustomSandboxTarget && process.platform === 'win32') {
+    stopRunningDaemonProcesses();
+  }
+
   fs.rmSync(targetCore, { recursive: true, force: true });
   copyDirRecursive(restoreSource, targetCore);
 
   // 重启守护进程并立即执行一次 --once 重新注入（沙箱 --target-dir 隔离模式下跳过全局服务干预）
+  const cliChannel = getArg('--channel', null);
   const realDaemon = path.join(targetCore, 'daemon.mjs');
   const wrapperDaemon = path.join(os.homedir(), '.gemini', 'antigravity', 'scripts', 'antigravity-font-daemon.mjs');
   if (!isCustomSandboxTarget) {
     if (process.platform === 'darwin') {
       const uid = process.getuid ? process.getuid() : 501;
       try {
-        execSync(`launchctl kickstart -k gui/${uid}/com.antigravity.customfont 2>/dev/null || launchctl kickstart -k gui/${uid}/com.antigravity.theme 2>/dev/null || true`);
+        execSync(
+          `launchctl kickstart -k gui/${uid}/com.antigravity.customfont 2>/dev/null || launchctl kickstart -k gui/${uid}/com.antigravity.theme 2>/dev/null || true`,
+          { stdio: 'ignore' }
+        );
       } catch {}
     } else if (process.platform === 'linux') {
       try {
-        execSync('systemctl --user restart antigravity-theme.service 2>/dev/null || true');
+        execSync(
+          '(systemctl --user reset-failed antigravity-theme.service 2>/dev/null || true) && systemctl --user restart antigravity-theme.service 2>/dev/null || true',
+          { stdio: 'ignore' }
+        );
       } catch {}
     } else if (process.platform === 'win32') {
-      stopRunningDaemonProcesses();
       let restartedViaTask = false;
       try {
         const r = spawnSync('schtasks', ['/Run', '/TN', 'AntigravityThemeDaemon'], {
@@ -3534,13 +4134,22 @@ async function runRollback() {
         } catch {}
       }
     }
-    spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', realDaemon, '--once'], {
-      stdio: 'inherit'
+    const onceArgs = ['--disable-warning=ExperimentalWarning', realDaemon, '--once'];
+    if (cliChannel === 'stable' || cliChannel === 'insiders' || cliChannel === 'auto') {
+      onceArgs.push('--channel', cliChannel);
+    }
+    const onceRes = spawnSync(process.execPath, onceArgs, {
+      encoding: 'utf8',
+      windowsHide: true
     });
+    if (onceRes.stdout) process.stderr.write(onceRes.stdout);
+    if (onceRes.stderr) process.stderr.write(onceRes.stderr);
   }
 
-  const env = await detectEnvironment('auto');
-  const live = isCustomSandboxTarget ? { skipped: true, reason: 'custom-target-dir' } : await inspectLiveWindow(env);
+  const env = await detectEnvironment(readTargetConfiguredChannel(targetDir));
+  const live = isCustomSandboxTarget
+    ? { skipped: true, reason: 'custom-target-dir' }
+    : await inspectLiveWindow(env, 9222, readTargetAllowedOrigins(targetDir));
   console.log(
     JSON.stringify(
       {
@@ -3636,6 +4245,14 @@ function buildDoctorUpdateSection(targetDir, env = null) {
   const nodeCompatible = !minNodeVersion || semverSatisfiesMin(process.versions.node, minNodeVersion);
   const available = Boolean(newer && hostCompatible && nodeCompatible);
   const dismissed = Boolean(available && dismissedVersion && dismissedVersion === latest);
+  const rawUpgradeErr =
+    typeof cache?.upgradeError === 'string' && cache.upgradeError.trim() ? cache.upgradeError.trim() : null;
+  const rawUpgradeFailedVer =
+    typeof cache?.upgradeFailedVersion === 'string' && cache.upgradeFailedVersion.trim()
+      ? cache.upgradeFailedVersion.trim().replace(/^v/i, '')
+      : null;
+  const upgradeError =
+    available && rawUpgradeErr && (!rawUpgradeFailedVer || rawUpgradeFailedVer === latest) ? rawUpgradeErr : null;
   return {
     enabled: updateCheckEnabled,
     current,
@@ -3647,6 +4264,7 @@ function buildDoctorUpdateSection(targetDir, env = null) {
     minNodeVersion,
     hostAppVersion,
     dismissed,
+    upgradeError,
     checkedAt: cache?.checkedAt || null,
     source: cache?.source || null,
     releaseUrl: cache?.releaseUrl || GITHUB_RELEASES_LATEST_URL,
@@ -3668,29 +4286,12 @@ function hasProcessProxyEnv() {
 function parseWindowsProxyFromRegStdout(out) {
   const text = String(out || '');
   if (!text) return null;
-  const enabledMatch = text.match(/ProxyEnable\s+REG_DWORD\s+0x([0-9a-f]+)/i);
+  const enabledMatch = text.match(/ProxyEnable[ \t]+REG_DWORD[ \t]+0x([0-9a-f]+)/i);
   if (!enabledMatch || parseInt(enabledMatch[1], 16) !== 1) return null;
-  const serverMatch = text.match(/ProxyServer\s+REG_SZ\s+([^\r\n]+)/i);
+  const serverMatch = text.match(/ProxyServer[ \t]+REG_SZ[ \t]*([^\r\n]*)/i);
   if (!serverMatch) return null;
-  const raw = serverMatch[1].trim();
-  if (!raw) return null;
-  let picked = raw;
-  if (raw.includes('=')) {
-    const pairs = raw.split(';').map((s) => s.trim()).filter(Boolean);
-    const map = Object.create(null);
-    for (const p of pairs) {
-      const idx = p.indexOf('=');
-      if (idx > 0) map[p.slice(0, idx).trim().toLowerCase()] = p.slice(idx + 1).trim();
-    }
-    if (map.https) picked = map.https;
-    else if (map.http) picked = map.http;
-    else if (map.socks) picked = map.socks.includes('://') ? map.socks : `socks5h://${map.socks}`;
-    else picked = pairs[0].slice(pairs[0].indexOf('=') + 1).trim();
-  }
-  if (picked && !/^[a-z0-9+.-]+:\/\//i.test(picked)) {
-    picked = `http://${picked}`;
-  }
-  return picked || null;
+  const parsed = parseProxyServerSpec(serverMatch[1]);
+  return parsed ? parsed.httpsProxy || parsed.httpProxy || null : null;
 }
 
 function execFileAsync(bin, cmdArgs, { timeoutMs = 8000, maxBuffer = 512 * 1024, signal = null } = {}) {
@@ -3911,12 +4512,14 @@ async function resolveGithubLatestTagFallback({ timeoutSec = 8, signal = null, p
 async function fetchRemoteUpdateMetadata({ manifestUrlOverride = null, requestedVersion = null, preferredMirror = null } = {}) {
   const allowLoopbackOrigin = manifestUrlOverride && isLoopbackHttpUrl(manifestUrlOverride) ? new URL(manifestUrlOverride).origin : null;
 
+  let cleanRequestedVersion = null;
   if (requestedVersion) {
     const m = String(requestedVersion).trim().match(/^v?(\d+\.\d+\.\d+)$/);
     if (!m) {
       return { ok: false, error: `Invalid --version "${requestedVersion}". Expected format like 6.0.7 or v6.0.7.` };
     }
     const cleanVer = m[1];
+    cleanRequestedVersion = cleanVer;
     const tag = `v${cleanVer}`;
     if (!manifestUrlOverride) {
       return {
@@ -3964,6 +4567,14 @@ async function fetchRemoteUpdateMetadata({ manifestUrlOverride = null, requested
     try {
       const parsed = JSON.parse(String(res.text).replace(/^\uFEFF/, ''));
       if (parsed && typeof parsed === 'object' && typeof parsed.version === 'string' && parsed.coreUpdateBundle) {
+        if (cleanRequestedVersion) {
+          const remoteVer = String(parsed.version).trim().replace(/^v/i, '');
+          if (remoteVer !== cleanRequestedVersion) {
+            const mismatchErr = `Requested version ${cleanRequestedVersion} does not match manifest version ${remoteVer}`;
+            errors.push({ mirror: m.id, url: m.url, error: mismatchErr });
+            return { ok: false, errors, error: mismatchErr };
+          }
+        }
         return { ok: true, allowLoopbackOrigin, source: m.id, manifest: parsed, errors };
       }
       errors.push({ mirror: m.id, url: m.url, error: 'invalid_manifest_schema' });
@@ -4089,6 +4700,12 @@ function inspectZipEntriesSafe(zipPath) {
     const parts = entry.split(/[\\/]+/);
     if (parts.some((p) => p === '..')) {
       return { ok: false, reason: 'zip_slip_traversal_detected', entry };
+    }
+  }
+  const zList = spawnSync('unzip', ['-Z', zipPath], { encoding: 'utf8', maxBuffer: 5 * 1024 * 1024 });
+  if (zList.status === 0 && typeof zList.stdout === 'string') {
+    if (/^l[rwxstST-]{9}\s/m.test(zList.stdout)) {
+      return { ok: false, reason: 'symlink_entry_in_zip' };
     }
   }
   return { ok: true, count: entries.length };
@@ -4235,12 +4852,262 @@ function acquireUpgradeLock(targetDir) {
   return { ok: false, error: 'Another upgrade process is already running' };
 }
 
+function isActiveUpgradeLockHeld(targetDir) {
+  try {
+    const lockPath = path.join(targetDir, '.cache', 'upgrade.lock');
+    if (!fs.existsSync(lockPath)) return false;
+    const st = fs.statSync(lockPath);
+    if (Date.now() - st.mtimeMs > 15 * 60 * 1000) return false;
+    const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    const holderPid = Number(parsed?.pid) || 0;
+    return holderPid > 0 && isUpgradeLockPidAlive(holderPid);
+  } catch {
+    return false;
+  }
+}
+
+function readTargetConfiguredChannel(targetDir) {
+  const cliCh = getArg('--channel', null);
+  if (cliCh === 'stable' || cliCh === 'insiders' || cliCh === 'auto') return cliCh;
+  const cfgPath = path.join(targetDir, 'user', 'config.json');
+  if (fs.existsSync(cfgPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, ''));
+      if (parsed?.channel === 'stable' || parsed?.channel === 'insiders') {
+        return parsed.channel;
+      }
+    } catch {}
+  }
+  return 'auto';
+}
+
+function readTargetPatchEnabled(targetDir) {
+  const cfgPath = path.join(targetDir, 'user', 'config.json');
+  if (!fs.existsSync(cfgPath)) return true;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed.enabled !== false;
+    }
+  } catch {}
+  return true;
+}
+
+function readTargetAllowedOrigins(targetDir) {
+  const cfgPath = path.join(targetDir, 'user', 'config.json');
+  if (!fs.existsSync(cfgPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (parsed && Array.isArray(parsed.allowedOrigins)) {
+      return parsed.allowedOrigins.filter((s) => typeof s === 'string' && s);
+    }
+  } catch {}
+  return null;
+}
+
+function hasCoreRuntimeBundleChanged(prevManifest, nextManifest) {
+  if (!prevManifest || !nextManifest) return true;
+  const prevVer = String(prevManifest.version || '').replace(/^v/i, '');
+  const nextVer = String(nextManifest.version || '').replace(/^v/i, '');
+  if (prevVer !== nextVer) return true;
+  for (const name of ['runtime.js', 'theme.css', 'i18n.json']) {
+    const prevSha = prevManifest.files?.[name]?.sha256 || '';
+    const nextSha = nextManifest.files?.[name]?.sha256 || '';
+    if (!prevSha || !nextSha || prevSha !== nextSha) return true;
+  }
+  return false;
+}
+
+function extractHandoffDaemonPatchVersion(handoffStdout) {
+  const text = String(handoffStdout || '');
+  const injectedMatches = Array.from(text.matchAll(/\[Daemon\] Injected \(([^)\r\n]+)\) into target/g));
+  if (injectedMatches.length > 0) {
+    const lastVer = injectedMatches[injectedMatches.length - 1][1]?.trim();
+    if (lastVer) return lastVer;
+  }
+  const startedMatches = Array.from(text.matchAll(/\[Antigravity Daemon\] Started \(([^)\r\n]+)\)/g));
+  if (startedMatches.length > 0) {
+    const lastStarted = startedMatches[startedMatches.length - 1][1]?.trim();
+    if (lastStarted) return lastStarted;
+  }
+  return null;
+}
+
+function isSamePatchBuildVersion(actualVer, expectedVer) {
+  const a = String(actualVer || '').trim();
+  const b = String(expectedVer || '').trim();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const normalizeChannelTag = (s) => s.replace(/-(?:stable|insiders)-([0-9a-f]{8})(-disabled)?$/i, '-$1$2');
+  return normalizeChannelTag(a) === normalizeChannelTag(b);
+}
+
+function verifySingleLivePageState(state, { expectedEnabled, expectedVersion, toVersion, preUpgradePatchVersion, stagedRuntimeChanged }) {
+  if (!state || typeof state !== 'object') {
+    return { ok: false, actualVersion: null, reason: 'missing_page_state' };
+  }
+  const actualVersion = typeof state.version === 'string' ? state.version.trim() : '';
+  if (!actualVersion) {
+    return { ok: false, actualVersion: null, reason: 'missing_runtime_version_marker' };
+  }
+
+  if (expectedVersion) {
+    if (!isSamePatchBuildVersion(actualVersion, expectedVersion)) {
+      return { ok: false, actualVersion, reason: 'runtime_version_mismatch' };
+    }
+  } else {
+    const escapedVer = String(toVersion || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const hasTargetSemver = escapedVer
+      ? new RegExp(`(?:^|[^0-9.])v?${escapedVer}(?:$|[^0-9.])`, 'i').test(actualVersion)
+      : false;
+    if (!hasTargetSemver) {
+      return { ok: false, actualVersion, reason: 'runtime_semver_mismatch' };
+    }
+    if (stagedRuntimeChanged && preUpgradePatchVersion && actualVersion === preUpgradePatchVersion) {
+      return { ok: false, actualVersion, reason: 'runtime_version_unchanged' };
+    }
+    if (expectedEnabled && actualVersion.endsWith('-disabled')) {
+      return { ok: false, actualVersion, reason: 'unexpected_disabled_marker' };
+    }
+    if (!expectedEnabled && !actualVersion.endsWith('-disabled')) {
+      return { ok: false, actualVersion, reason: 'missing_disabled_marker' };
+    }
+  }
+
+  if (expectedEnabled && !state.hasStyle) {
+    return { ok: false, actualVersion, reason: 'missing_theme_style_element' };
+  }
+  if (!expectedEnabled && state.hasStyle) {
+    return { ok: false, actualVersion, reason: 'unexpected_style_when_disabled' };
+  }
+  return { ok: true, actualVersion, reason: null };
+}
+
+function verifyPostUpgradeLiveWindow({
+  postLiveReport,
+  postEnv = null,
+  targetDir,
+  toVersion,
+  handoffStdout = '',
+  preUpgradePatchVersion = null,
+  stagedRuntimeChanged = false
+}) {
+  const expectedEnabled = readTargetPatchEnabled(targetDir);
+  const handoffPatchVer = extractHandoffDaemonPatchVersion(handoffStdout);
+  const expectedVersion = handoffPatchVer
+    ? expectedEnabled
+      ? handoffPatchVer
+      : `${handoffPatchVer}-disabled`
+    : null;
+
+  if (!postLiveReport || !postLiveReport.reachable) {
+    if (postEnv && Array.isArray(postEnv.runningProcesses) && postEnv.runningProcesses.length === 0) {
+      return { ok: true, expectedEnabled, expectedVersion, actualVersion: null, reason: 'host_closed_during_upgrade' };
+    }
+    return { ok: false, expectedEnabled, expectedVersion, actualVersion: null, reason: 'live_window_unreachable' };
+  }
+  if (postLiveReport.pages === 0) {
+    return { ok: true, expectedEnabled, expectedVersion, actualVersion: null, reason: 'no_workbench_pages' };
+  }
+
+  const candidateStates =
+    Array.isArray(postLiveReport.hostTargets) && postLiveReport.hostTargets.length > 0
+      ? postLiveReport.hostTargets.map((h) => h.state)
+      : [postLiveReport.state];
+
+  let lastActualVersion = null;
+  for (const st of candidateStates) {
+    const check = verifySingleLivePageState(st, {
+      expectedEnabled,
+      expectedVersion,
+      toVersion,
+      preUpgradePatchVersion,
+      stagedRuntimeChanged
+    });
+    lastActualVersion = check.actualVersion;
+    if (!check.ok) {
+      return {
+        ok: false,
+        expectedEnabled,
+        expectedVersion,
+        actualVersion: check.actualVersion,
+        reason: check.reason
+      };
+    }
+  }
+  return {
+    ok: true,
+    expectedEnabled,
+    expectedVersion,
+    actualVersion: lastActualVersion,
+    reason: null
+  };
+}
+
+function summarizeHandoffFailure({ handoffRes, postIntegrity, postLiveOk, postLiveCheck }) {
+  const rawStderr = String(handoffRes?.stderr || '');
+  const errLines = rawStderr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !/^\[WARN\]/i.test(l));
+  const injLine = errLines.find((l) => /\[Daemon\] Injection (?:failed|error)/i.test(l)) || '';
+  const strippedInj = injLine
+    ? injLine
+        .replace(/^\[Daemon\]\s*Injection (?:failed|error)(?:\s+on\s+[^:]+)?:\s*(?:Script Exception:\s*)?/i, '')
+        .trim()
+    : '';
+  const jsErrLine =
+    errLines.find(
+      (l) =>
+        /\b(?:SyntaxError|ReferenceError|TypeError|RangeError|URIError|Error):/i.test(l) &&
+        !/^\[Daemon\]\s*Injection/i.test(l)
+    ) || '';
+  const preferredErrLine =
+    (strippedInj && !/^(?:evalmachine\.)?<anonymous>:\d+$/.test(strippedInj)
+      ? strippedInj
+      : jsErrLine || strippedInj) ||
+    errLines.find((l) => /^\[ERROR\]/i.test(l)) ||
+    jsErrLine ||
+    (handoffRes?.status !== 0 && errLines.length > 0 ? errLines[0] : '');
+  const cleanDetail = preferredErrLine
+    ? preferredErrLine
+        .replace(/^\[Daemon\]\s*Injection (?:failed|error)(?:\s+on\s+[^:]+)?:\s*(?:Script Exception:\s*)?/i, '')
+        .replace(/^\[ERROR\]\s*/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 72)
+    : '';
+
+  if (handoffRes?.status !== 0) {
+    const exitTag = handoffRes?.signal
+      ? `signal ${handoffRes.signal}`
+      : typeof handoffRes?.status === 'number'
+      ? `exit ${handoffRes.status}`
+      : handoffRes?.error?.code
+      ? `spawn ${handoffRes.error.code}`
+      : 'aborted';
+    return `Bootstrap handoff failed (${exitTag})${cleanDetail ? `: ${cleanDetail}` : ''}`.slice(0, 140);
+  }
+  if (!postIntegrity?.ok) {
+    return 'Post-upgrade core SHA-256 verification failed';
+  }
+  if (!postLiveOk) {
+    const reasonTag = postLiveCheck?.reason || 'unverified';
+    const prefix = `Post-upgrade live window verification failed (${reasonTag}`;
+    if (!cleanDetail) return `${prefix})`.slice(0, 140);
+    const budget = Math.max(12, 139 - prefix.length - 2);
+    return `${prefix}: ${cleanDetail.slice(0, budget)})`;
+  }
+  return 'Post-upgrade verification failed';
+}
+
 async function runUpgrade() {
   const checkOnly = hasFlag('--check') || hasFlag('--dry-run');
   const force = hasFlag('--force');
   const requestedVersion = getArg('--version', null);
   const preferredMirror = getArg('--mirror', null);
   const manifestUrlOverride = getArg('--manifest-url', null);
+  const explicitCliChannel = getArg('--channel', null);
   const defaultTarget = resolveGlobalInstallDir();
   const targetDir = path.resolve(getArg('--target-dir', resolveDefaultTargetDir()));
   const isCustomSandboxTarget =
@@ -4256,14 +5123,56 @@ async function runUpgrade() {
   const preUpgradeManifestSha = fs.existsSync(preUpgradeManifestPath) ? sha256File(preUpgradeManifestPath) : null;
   const existingCache = readUpdateCheckCache(targetDir) || {};
 
+  let lock = null;
+  const releaseLockOnce = () => {
+    if (lock) lock.release();
+  };
+  if (!checkOnly) {
+    lock = acquireUpgradeLock(targetDir);
+    if (!lock.ok) {
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            step: 'lock',
+            error: lock.error,
+            ...(lock.pid ? { holderPid: lock.pid } : {}),
+            ...(lock.startedAt ? { holderStartedAt: lock.startedAt } : {})
+          },
+          null,
+          2
+        )
+      );
+      process.exit(1);
+    }
+    process.once('exit', releaseLockOnce);
+  }
+
   const remote = await fetchRemoteUpdateMetadata({ manifestUrlOverride, requestedVersion, preferredMirror });
   if (!remote.ok || !remote.manifest) {
+    releaseLockOnce();
     console.error(JSON.stringify({ ok: false, currentVersion: fromVersion, error: remote.error, errors: remote.errors || [] }, null, 2));
     process.exit(1);
   }
 
   const remoteManifest = remote.manifest;
-  const toVersion = String(remoteManifest.version || '').replace(/^v/i, '');
+  const toVersion = String(remoteManifest.version || '').trim().replace(/^v/i, '');
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(toVersion)) {
+    releaseLockOnce();
+    console.error(
+      JSON.stringify(
+        {
+          ok: false,
+          step: 'manifest_version',
+          currentVersion: fromVersion,
+          error: `Invalid remote manifest version "${remoteManifest.version ?? ''}"`
+        },
+        null,
+        2
+      )
+    );
+    process.exit(1);
+  }
   const semverNewer = isUpdateAvailableVersion(fromVersion, toVersion);
   const requiredMinAgVersion =
     typeof remoteManifest.minAntigravityVersion === 'string' && remoteManifest.minAntigravityVersion.trim()
@@ -4274,8 +5183,13 @@ async function runUpgrade() {
       ? remoteManifest.minNodeVersion.trim()
       : '22.0.0';
 
-  const hostEnv = requiredMinAgVersion || !checkOnly ? await detectEnvironment('auto') : null;
-  const hostAppVersion = hostEnv?.appVersion || null;
+  const targetChannel = readTargetConfiguredChannel(targetDir);
+  const hostEnv = requiredMinAgVersion || !checkOnly ? await detectEnvironment(targetChannel) : null;
+  const cachedHostAppVersion =
+    typeof existingCache.hostAppVersion === 'string' && existingCache.hostAppVersion.trim()
+      ? existingCache.hostAppVersion.trim()
+      : null;
+  const hostAppVersion = hostEnv?.appVersion || cachedHostAppVersion || null;
   const hostVersionCompatible =
     !requiredMinAgVersion || !hostAppVersion || semverSatisfiesMin(hostAppVersion, requiredMinAgVersion);
   const nodeVersionCompatible = semverSatisfiesMin(process.versions.node, requiredMinNodeVersion);
@@ -4300,13 +5214,17 @@ async function runUpgrade() {
     incompatibleHost,
     incompatibleNode,
     dismissedVersion: checkOnly || !updateAvailable ? null : existingCache.dismissedVersion || null,
+    upgradeError: null,
+    upgradeFailedVersion: null,
     changelog: Array.isArray(remoteManifest.changelog) ? remoteManifest.changelog : [],
     bundleBytes: Number(remoteManifest.coreUpdateBundle?.bytes || 0) || null,
     releaseUrl
   };
-  writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
 
   if (checkOnly) {
+    if (!isActiveUpgradeLockHeld(targetDir)) {
+      writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
+    }
     console.log(
       JSON.stringify(
         {
@@ -4334,6 +5252,8 @@ async function runUpgrade() {
   }
 
   if ((semverNewer || requestedVersion || force) && !hostVersionCompatible && !force) {
+    writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
+    releaseLockOnce();
     console.error(
       JSON.stringify(
         {
@@ -4353,6 +5273,8 @@ async function runUpgrade() {
   }
 
   if ((semverNewer || requestedVersion || force) && !nodeVersionCompatible && !force) {
+    writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
+    releaseLockOnce();
     console.error(
       JSON.stringify(
         {
@@ -4371,6 +5293,8 @@ async function runUpgrade() {
   }
 
   if (!updateAvailable && !force && !requestedVersion) {
+    writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
+    releaseLockOnce();
     console.log(
       JSON.stringify(
         {
@@ -4394,9 +5318,24 @@ async function runUpgrade() {
     return;
   }
 
+  writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
+
+  const persistUpgradeFailure = (rawReason, overrides = null) => {
+    const cleanMsg = String(rawReason || 'Upgrade failed').replace(/\s+/g, ' ').trim().slice(0, 140) || 'Upgrade failed';
+    writeUpdateCheckCache(targetDir, {
+      ...preUpgradeCacheSnapshot,
+      ...(overrides && typeof overrides === 'object' ? overrides : {}),
+      upgradeError: cleanMsg,
+      upgradeFailedVersion: toVersion
+    });
+    return cleanMsg;
+  };
+
   const bundleSpec = remoteManifest.coreUpdateBundle || remoteManifest.fullBundle;
   if (!bundleSpec || !Array.isArray(bundleSpec.mirrors) || bundleSpec.mirrors.length === 0) {
-    console.error('[ERROR] Remote manifest has no downloadable update bundle mirrors.');
+    const errMsg = persistUpgradeFailure('Remote manifest has no downloadable update bundle mirrors');
+    releaseLockOnce();
+    console.error(JSON.stringify({ ok: false, step: 'mirrors', error: errMsg }, null, 2));
     process.exit(1);
   }
 
@@ -4404,11 +5343,13 @@ async function runUpgrade() {
     m && m.url && isAllowedUpdateUrl(m.url, { allowLoopbackOrigin: remote.allowLoopbackOrigin })
   );
   if (trustedMirrors.length === 0) {
+    const errMsg = persistUpgradeFailure('No trusted update bundle URL matched official domain whitelist');
+    releaseLockOnce();
     console.error(
       JSON.stringify(
         {
           ok: false,
-          error: 'No trusted update bundle URL matched official domain whitelist',
+          error: errMsg,
           rejectedUrls: bundleSpec.mirrors.map((m) => m?.url).filter(Boolean)
         },
         null,
@@ -4418,27 +5359,22 @@ async function runUpgrade() {
     process.exit(1);
   }
 
-  const lock = acquireUpgradeLock(targetDir);
-  if (!lock.ok) {
-    console.error(
-      JSON.stringify(
-        {
-          ok: false,
-          step: 'lock',
-          error: lock.error,
-          ...(lock.pid ? { holderPid: lock.pid } : {}),
-          ...(lock.startedAt ? { holderStartedAt: lock.startedAt } : {})
-        },
-        null,
-        2
-      )
-    );
+  const rawBundleFilename =
+    bundleSpec.filename != null ? String(bundleSpec.filename).trim() : `core-update-v${toVersion}.zip`;
+  if (
+    !rawBundleFilename ||
+    rawBundleFilename.includes('/') ||
+    rawBundleFilename.includes('\\') ||
+    rawBundleFilename.includes('..') ||
+    rawBundleFilename.includes('\0') ||
+    path.basename(rawBundleFilename) !== rawBundleFilename ||
+    !/^[A-Za-z0-9._-]+$/.test(rawBundleFilename)
+  ) {
+    const errMsg = persistUpgradeFailure(`Invalid update bundle filename "${rawBundleFilename}"`);
+    releaseLockOnce();
+    console.error(JSON.stringify({ ok: false, step: 'bundle_filename', error: errMsg }, null, 2));
     process.exit(1);
   }
-  const releaseLockOnce = () => {
-    lock.release();
-  };
-  process.once('exit', releaseLockOnce);
 
   const stagingRoot = path.join(targetDir, '.cache', 'staging', `upgrade-v${toVersion}-${process.pid}-${Date.now()}`);
   const unpackedDir = path.join(stagingRoot, 'unpacked');
@@ -4448,21 +5384,95 @@ async function runUpgrade() {
     } catch {}
   };
 
-  let backupInstallScriptPath = null;
-  const restoreInstallScriptBackup = () => {
-    if (backupInstallScriptPath && fs.existsSync(backupInstallScriptPath)) {
+  const ROOT_DOC_FILES = ['install.mjs', 'SKILL.md', 'README.md', 'CHANGELOG.md'];
+  const rootBackupDir = path.join(stagingRoot, 'root-backup');
+  let rootBackupRecords = null;
+  let handoffStarted = false;
+  const snapshotRootFilesBackup = () => {
+    fs.mkdirSync(rootBackupDir, { recursive: true });
+    rootBackupRecords = ROOT_DOC_FILES.map((name) => {
+      const srcPath = path.join(targetDir, name);
+      const existed = fs.existsSync(srcPath);
+      const backupPath = path.join(rootBackupDir, name);
+      if (existed) {
+        fs.copyFileSync(srcPath, backupPath);
+      }
+      return { name, existed, backupPath };
+    });
+  };
+  const restoreRootFilesBackup = () => {
+    if (!Array.isArray(rootBackupRecords)) return;
+    for (const rec of rootBackupRecords) {
+      const destPath = path.join(targetDir, rec.name);
       try {
-        fs.copyFileSync(backupInstallScriptPath, path.join(targetDir, 'install.mjs'));
+        if (rec.existed) {
+          if (fs.existsSync(rec.backupPath)) {
+            fs.copyFileSync(rec.backupPath, destPath);
+          }
+        } else if (fs.existsSync(destPath)) {
+          fs.unlinkSync(destPath);
+        }
       } catch {}
     }
   };
+  const recoverAfterFailedHandoff = (failReason, { precomputedPostIntegrity = null } = {}) => {
+    persistUpgradeFailure(failReason);
+    restoreRootFilesBackup();
+    let rollbackOk = false;
+    const integrityCheck = precomputedPostIntegrity || verifyCoreIntegrity(targetDir);
+    const installedAfterFail = readInstalledCoreManifest(targetDir)?.version || null;
+    const postFailManifestSha = fs.existsSync(preUpgradeManifestPath) ? sha256File(preUpgradeManifestPath) : null;
+    const coreWasModified =
+      !integrityCheck.ok ||
+      installedAfterFail !== fromVersion ||
+      (preUpgradeManifestSha && postFailManifestSha !== preUpgradeManifestSha);
+    if (coreWasModified) {
+      try {
+        const rbTarget = path.join(targetDir, 'install.mjs');
+        const rbScript = fs.existsSync(rbTarget) ? rbTarget : __filename;
+        const rbArgs = [rbScript, 'rollback', '--target-dir', targetDir];
+        if (explicitCliChannel === 'stable' || explicitCliChannel === 'insiders' || explicitCliChannel === 'auto') {
+          rbArgs.push('--channel', explicitCliChannel);
+        }
+        if (!isCustomSandboxTarget) rbArgs.push('--register-service');
+        const rbRes = spawnSync(process.execPath, rbArgs, { encoding: 'utf8', windowsHide: true });
+        rollbackOk = rbRes.status === 0;
+      } catch {}
+      persistUpgradeFailure(failReason);
+    } else {
+      if (!isCustomSandboxTarget && process.platform === 'win32') {
+        // Windows 在 handoff 前已停止旧守护进程；若 handoff 在拉起新服务前失败（core 未改动），需确保恢复守护进程运行
+        const realDaemon = path.join(targetDir, 'core', 'daemon.mjs');
+        const wrapperDaemon = path.join(os.homedir(), '.gemini', 'antigravity', 'scripts', 'antigravity-font-daemon.mjs');
+        let started = false;
+        try {
+          const r = spawnSync('schtasks', ['/Run', '/TN', 'AntigravityThemeDaemon'], {
+            stdio: 'ignore',
+            windowsHide: true
+          });
+          started = r.status === 0;
+        } catch {}
+        if (!started && fs.existsSync(realDaemon)) {
+          try {
+            const child = spawn(
+              process.execPath,
+              ['--disable-warning=ExperimentalWarning', fs.existsSync(wrapperDaemon) ? wrapperDaemon : realDaemon],
+              { cwd: os.homedir(), detached: true, stdio: 'ignore', windowsHide: true }
+            );
+            child.unref();
+          } catch {}
+        }
+      }
+      rollbackOk = true;
+    }
+    return rollbackOk;
+  };
 
-  let wrotePostUpgradeCache = false;
   try {
     fs.mkdirSync(stagingRoot, { recursive: true });
     const downloadAssetSpec = {
       id: `core-update-v${toVersion}`,
-      filename: bundleSpec.filename || `core-update-v${toVersion}.zip`,
+      filename: rawBundleFilename,
       url: trustedMirrors[0].url,
       mirrors: trustedMirrors,
       kind: 'zip',
@@ -4477,35 +5487,45 @@ async function runUpgrade() {
     });
     if (!dlRes.ok || !dlRes.filePath) {
       cleanupStaging();
-      console.error(JSON.stringify({ ok: false, step: 'download', error: 'Failed to download verified update package', details: dlRes }, null, 2));
+      const errMsg = persistUpgradeFailure('Failed to download verified update package');
+      releaseLockOnce();
+      console.error(JSON.stringify({ ok: false, step: 'download', error: errMsg, details: dlRes }, null, 2));
       process.exit(1);
     }
 
     const zipCheck = inspectZipEntriesSafe(dlRes.filePath);
     if (!zipCheck.ok) {
       cleanupStaging();
-      console.error(JSON.stringify({ ok: false, step: 'zip_security_check', ...zipCheck }, null, 2));
+      const errMsg = persistUpgradeFailure(`Archive security check failed: ${zipCheck.reason || 'unsafe_zip'}`);
+      releaseLockOnce();
+      console.error(JSON.stringify({ ok: false, step: 'zip_security_check', error: errMsg, ...zipCheck }, null, 2));
       process.exit(1);
     }
 
     const extractRes = extractZipArchive(dlRes.filePath, unpackedDir);
     if (!extractRes.ok) {
       cleanupStaging();
-      console.error(JSON.stringify({ ok: false, step: 'extract', ...extractRes }, null, 2));
+      const errMsg = persistUpgradeFailure(`Failed to extract update archive: ${extractRes.error || 'extract_failed'}`);
+      releaseLockOnce();
+      console.error(JSON.stringify({ ok: false, step: 'extract', error: errMsg, ...extractRes }, null, 2));
       process.exit(1);
     }
 
     const treeCheck = inspectExtractedTreeSafe(unpackedDir);
     if (!treeCheck.ok) {
       cleanupStaging();
-      console.error(JSON.stringify({ ok: false, step: 'extracted_tree_security_check', ...treeCheck }, null, 2));
+      const errMsg = persistUpgradeFailure(`Extracted tree security check failed: ${treeCheck.reason || 'unsafe_tree'}`);
+      releaseLockOnce();
+      console.error(JSON.stringify({ ok: false, step: 'extracted_tree_security_check', error: errMsg, ...treeCheck }, null, 2));
       process.exit(1);
     }
 
     const stagedRoot = locateStagedBundleRoot(unpackedDir);
     if (!stagedRoot) {
       cleanupStaging();
-      console.error(JSON.stringify({ ok: false, step: 'locate_bundle', error: 'Extracted archive does not contain install.mjs + core/' }, null, 2));
+      const errMsg = persistUpgradeFailure('Extracted archive does not contain install.mjs + core/');
+      releaseLockOnce();
+      console.error(JSON.stringify({ ok: false, step: 'locate_bundle', error: errMsg }, null, 2));
       process.exit(1);
     }
 
@@ -4513,12 +5533,14 @@ async function runUpgrade() {
     const stagedManifest = readInstalledCoreManifest(stagedRoot);
     if (!stagedIntegrity.ok || !stagedManifest || stagedManifest.name !== 'chuanban-antigravity-theme-patch') {
       cleanupStaging();
+      const errMsg = persistUpgradeFailure('Staged package failed core manifest SHA-256 verification');
+      releaseLockOnce();
       console.error(
         JSON.stringify(
           {
             ok: false,
             step: 'staged_integrity',
-            error: 'Staged package failed core manifest SHA-256 verification',
+            error: errMsg,
             stagedIntegrity
           },
           null,
@@ -4529,11 +5551,14 @@ async function runUpgrade() {
     }
     if (String(stagedManifest.version).replace(/^v/i, '') !== toVersion) {
       cleanupStaging();
+      const errMsg = persistUpgradeFailure(`Staged version mismatch (expected ${toVersion}, got ${stagedManifest.version})`);
+      releaseLockOnce();
       console.error(
         JSON.stringify(
           {
             ok: false,
             step: 'version_mismatch',
+            error: errMsg,
             expected: toVersion,
             actual: stagedManifest.version
           },
@@ -4545,12 +5570,21 @@ async function runUpgrade() {
     }
     if (!semverSatisfiesMin(process.versions.node, stagedManifest.minNodeVersion || '22.0.0') && !force) {
       cleanupStaging();
+      const errMsg = persistUpgradeFailure(
+        `Node.js >= ${stagedManifest.minNodeVersion} required for v${toVersion} (current: ${process.versions.node})`,
+        {
+          minNodeVersion: stagedManifest.minNodeVersion,
+          incompatibleNode: Boolean(semverNewer),
+          updateAvailable: false
+        }
+      );
+      releaseLockOnce();
       console.error(
         JSON.stringify(
           {
             ok: false,
             step: 'node_version',
-            error: `Node.js >= ${stagedManifest.minNodeVersion} required for v${toVersion} (current: ${process.versions.node})`
+            error: errMsg
           },
           null,
           2
@@ -4565,6 +5599,15 @@ async function runUpgrade() {
         : requiredMinAgVersion;
     if (stagedMinAgVersion && hostAppVersion && !semverSatisfiesMin(hostAppVersion, stagedMinAgVersion) && !force) {
       cleanupStaging();
+      const errMsg = persistUpgradeFailure(
+        `Antigravity >= ${stagedMinAgVersion} required for v${toVersion} (current: ${hostAppVersion})`,
+        {
+          minAntigravityVersion: stagedMinAgVersion,
+          incompatibleHost: Boolean(semverNewer),
+          updateAvailable: false
+        }
+      );
+      releaseLockOnce();
       console.error(
         JSON.stringify(
           {
@@ -4572,7 +5615,7 @@ async function runUpgrade() {
             step: 'antigravity_version',
             hostAppVersion,
             minAntigravityVersion: stagedMinAgVersion,
-            error: `Antigravity >= ${stagedMinAgVersion} required for v${toVersion} (current: ${hostAppVersion})`
+            error: errMsg
           },
           null,
           2
@@ -4581,27 +5624,30 @@ async function runUpgrade() {
       process.exit(1);
     }
 
+    const stagedRuntimeChanged = hasCoreRuntimeBundleChanged(currentManifest, stagedManifest);
+    const targetAllowedOrigins = readTargetAllowedOrigins(targetDir);
+
     let preUpgradeLiveReachable = false;
+    let preUpgradePatchVersion = null;
     if (!isCustomSandboxTarget) {
-      const preEnv = hostEnv || (await detectEnvironment('auto'));
-      const preLive = await inspectLiveWindow(preEnv);
+      const preEnv = hostEnv || (await detectEnvironment(targetChannel));
+      const preLive = await inspectLiveWindow(preEnv, 9222, targetAllowedOrigins);
       preUpgradeLiveReachable = Boolean(preLive.reachable);
+      preUpgradePatchVersion =
+        typeof preLive?.state?.version === 'string' && preLive.state.version.trim()
+          ? preLive.state.version.trim()
+          : null;
     }
 
-    const currentInstallScript = path.join(targetDir, 'install.mjs');
-    if (fs.existsSync(currentInstallScript)) {
-      const backupsDir = path.join(targetDir, 'backups');
-      fs.mkdirSync(backupsDir, { recursive: true });
-      backupInstallScriptPath = path.join(backupsDir, 'install.mjs.prev');
-      fs.copyFileSync(currentInstallScript, backupInstallScriptPath);
-    }
+    snapshotRootFilesBackup();
+    handoffStarted = true;
 
     // 仅 Windows 提前停守护进程释放 NTFS 文件锁；macOS(launchd)/Linux(systemd) 由 handoff 落盘后的服务重启原子接管，避免 cgroup/KeepAlive 自杀或并发抢占
     if (!isCustomSandboxTarget && process.platform === 'win32') {
       stopRunningDaemonProcesses();
     }
 
-    // 先写入升级完成态缓存，使 handoff 内的 --once 与新启动守护进程首帧即读到最新状态（失败时自动恢复）
+    // 先写入升级完成态缓存，使 handoff 内的 --once 与新启动守护进程首帧即读到最新状态（失败时自动恢复并附带持久化错误原因）
     const upgradedIso = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     writeUpdateCheckCache(targetDir, {
       checkedAt: upgradedIso,
@@ -4616,67 +5662,179 @@ async function runUpgrade() {
       incompatibleHost: false,
       incompatibleNode: false,
       dismissedVersion: null,
+      upgradeError: null,
+      upgradeFailedVersion: null,
       changelog: Array.isArray(remoteManifest.changelog) ? remoteManifest.changelog : [],
       bundleBytes: dlRes.bytes,
       releaseUrl
     });
-    wrotePostUpgradeCache = true;
+
+    const targetUserCfgPath = path.join(targetDir, 'user', 'config.json');
+    let preHandoffUserCfgRawBuf = null;
+    let preHandoffUserCfgJson = null;
+    let preHandoffUserCfgHadChannel = false;
+    let preHandoffUserCfgChannel = undefined;
+    let preHandoffUserCfgInstalledLocale = undefined;
+    if (fs.existsSync(targetUserCfgPath)) {
+      try {
+        preHandoffUserCfgRawBuf = fs.readFileSync(targetUserCfgPath);
+        const parsedPreCfg = JSON.parse(preHandoffUserCfgRawBuf.toString('utf8').replace(/^\uFEFF/, ''));
+        if (parsedPreCfg && typeof parsedPreCfg === 'object' && !Array.isArray(parsedPreCfg)) {
+          preHandoffUserCfgJson = JSON.stringify(parsedPreCfg);
+          preHandoffUserCfgHadChannel = Object.prototype.hasOwnProperty.call(parsedPreCfg, 'channel');
+          preHandoffUserCfgChannel = parsedPreCfg.channel;
+          preHandoffUserCfgInstalledLocale = parsedPreCfg.installedLocale;
+        }
+      } catch {}
+    }
 
     // Bootstrap Handoff：由暂存区的新版 install.mjs 接管安装事务
-    const handoffArgs = [path.join(stagedRoot, 'install.mjs'), 'install', '--target-dir', targetDir];
+    const stagedInstallPath = path.join(stagedRoot, 'install.mjs');
+    const hasExplicitChannel =
+      explicitCliChannel === 'stable' || explicitCliChannel === 'insiders' || explicitCliChannel === 'auto';
+    let stagedSupportsPreserveChannel = false;
+    if (hasExplicitChannel) {
+      try {
+        stagedSupportsPreserveChannel = fs.readFileSync(stagedInstallPath, 'utf8').includes('--preserve-user-channel');
+      } catch {}
+    }
+    const handoffArgs = [stagedInstallPath, 'install', '--target-dir', targetDir];
+    if (hasExplicitChannel && stagedSupportsPreserveChannel) {
+      handoffArgs.push('--channel', explicitCliChannel, '--preserve-user-channel');
+    }
     if (!isCustomSandboxTarget) {
       handoffArgs.push('--register-service');
     }
-    const handoffRes = spawnSync(process.execPath, handoffArgs, {
+    const rawHandoffRes = spawnSync(process.execPath, handoffArgs, {
       cwd: stagedRoot,
       encoding: 'utf8',
       windowsHide: true,
       maxBuffer: 10 * 1024 * 1024
     });
+    let extraOnceStdout = '';
+    let extraOnceStderr = '';
+    if (
+      hasExplicitChannel &&
+      !stagedSupportsPreserveChannel &&
+      !isCustomSandboxTarget &&
+      rawHandoffRes.status === 0
+    ) {
+      const targetDaemonPath = path.join(targetDir, 'core', 'daemon.mjs');
+      if (fs.existsSync(targetDaemonPath)) {
+        const extraOnceRes = spawnSync(
+          process.execPath,
+          ['--disable-warning=ExperimentalWarning', targetDaemonPath, '--once', '--channel', explicitCliChannel],
+          { encoding: 'utf8', windowsHide: true, maxBuffer: 5 * 1024 * 1024 }
+        );
+        extraOnceStdout = extraOnceRes.stdout || '';
+        extraOnceStderr = extraOnceRes.stderr || '';
+      }
+    }
+    const handoffRes = {
+      ...rawHandoffRes,
+      stdout: `${rawHandoffRes.stdout || ''}${extraOnceStdout ? `\n${extraOnceStdout}` : ''}`,
+      stderr: `${rawHandoffRes.stderr || ''}${extraOnceStderr ? `\n${extraOnceStderr}` : ''}`
+    };
+
+    if (preHandoffUserCfgJson !== null && fs.existsSync(targetUserCfgPath)) {
+      try {
+        const postRawBuf = fs.readFileSync(targetUserCfgPath);
+        const parsedPostCfg = JSON.parse(postRawBuf.toString('utf8').replace(/^\uFEFF/, ''));
+        if (parsedPostCfg && typeof parsedPostCfg === 'object' && !Array.isArray(parsedPostCfg)) {
+          let mutatedPost = false;
+          if (preHandoffUserCfgInstalledLocale === 'none' && parsedPostCfg.installedLocale !== 'none') {
+            parsedPostCfg.installedLocale = 'none';
+            mutatedPost = true;
+          }
+          if (hasExplicitChannel) {
+            const desiredChannel = preHandoffUserCfgHadChannel && preHandoffUserCfgChannel ? preHandoffUserCfgChannel : 'auto';
+            if (parsedPostCfg.channel !== desiredChannel) {
+              if (!preHandoffUserCfgHadChannel) {
+                delete parsedPostCfg.channel;
+              } else {
+                parsedPostCfg.channel = desiredChannel;
+              }
+              mutatedPost = true;
+            }
+          }
+          if (JSON.stringify(parsedPostCfg) === preHandoffUserCfgJson && preHandoffUserCfgRawBuf) {
+            if (!postRawBuf.equals(preHandoffUserCfgRawBuf)) {
+              fs.writeFileSync(targetUserCfgPath, preHandoffUserCfgRawBuf);
+            }
+          } else if (mutatedPost) {
+            if (hasExplicitChannel && !preHandoffUserCfgHadChannel) {
+              parsedPostCfg.channel = 'auto';
+            }
+            fs.writeFileSync(targetUserCfgPath, JSON.stringify(parsedPostCfg, null, 2) + '\n', 'utf8');
+          }
+        }
+      } catch {}
+    }
 
     const postIntegrity = verifyCoreIntegrity(targetDir);
     let postLiveOk = true;
     let postLiveReport = null;
-    if (!isCustomSandboxTarget && preUpgradeLiveReachable) {
-      const postEnv = await detectEnvironment('auto');
-      postLiveReport = await inspectLiveWindow(postEnv);
-      postLiveOk = Boolean(postLiveReport.reachable && (postLiveReport.pages === 0 || postLiveReport.state?.hasStyle));
+    let postLiveCheck = null;
+    const handoffCombinedOutput = `${handoffRes.stdout || ''}\n${handoffRes.stderr || ''}`;
+    const handoffTouchedLiveTarget =
+      /\[Daemon\] (?:Attached (?:target|iframe):|Injected \(|Injection (?:failed|error)\b)/i.test(handoffCombinedOutput);
+    if (!isCustomSandboxTarget && (preUpgradeLiveReachable || handoffTouchedLiveTarget)) {
+      const hasDeterministicInjectionError = /\[Daemon\] Injection (?:failed|error)/i.test(String(handoffRes.stderr || ''));
+      const retryDelaysMs = hasDeterministicInjectionError ? [250] : [250, 350, 500, 700];
+      let postEnv = await detectEnvironment(targetChannel);
+      postLiveReport = await inspectLiveWindow(postEnv, 9222, targetAllowedOrigins);
+      postLiveCheck = verifyPostUpgradeLiveWindow({
+        postLiveReport,
+        postEnv,
+        targetDir,
+        toVersion,
+        handoffStdout: handoffRes.stdout || '',
+        preUpgradePatchVersion,
+        stagedRuntimeChanged
+      });
+      for (const delayMs of retryDelaysMs) {
+        if (postLiveCheck.ok) break;
+        await new Promise((r) => setTimeout(r, delayMs));
+        postEnv = await detectEnvironment(targetChannel);
+        postLiveReport = await inspectLiveWindow(postEnv, 9222, targetAllowedOrigins);
+        postLiveCheck = verifyPostUpgradeLiveWindow({
+          postLiveReport,
+          postEnv,
+          targetDir,
+          toVersion,
+          handoffStdout: handoffRes.stdout || '',
+          preUpgradePatchVersion,
+          stagedRuntimeChanged
+        });
+      }
+      postLiveOk = postLiveCheck.ok;
     }
 
     if (handoffRes.status !== 0 || !postIntegrity.ok || !postLiveOk) {
-      writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
-      wrotePostUpgradeCache = false;
-      restoreInstallScriptBackup();
-      let rollbackOk = false;
-      const installedAfterFail = readInstalledCoreManifest(targetDir)?.version || null;
-      const postFailManifestSha = fs.existsSync(preUpgradeManifestPath) ? sha256File(preUpgradeManifestPath) : null;
-      const coreWasModified =
-        !postIntegrity.ok ||
-        installedAfterFail !== fromVersion ||
-        (preUpgradeManifestSha && postFailManifestSha !== preUpgradeManifestSha);
-      if (coreWasModified) {
-        try {
-          const rbTarget = path.join(targetDir, 'install.mjs');
-          const rbArgs = [rbTarget, 'rollback', '--target-dir', targetDir];
-          if (!isCustomSandboxTarget) rbArgs.push('--register-service');
-          const rbRes = spawnSync(process.execPath, rbArgs, { encoding: 'utf8', windowsHide: true });
-          rollbackOk = rbRes.status === 0;
-        } catch {}
-      } else {
-        rollbackOk = true;
-      }
+      const handoffFailMsg = summarizeHandoffFailure({
+        handoffRes,
+        postIntegrity,
+        postLiveOk,
+        postLiveCheck
+      });
+      // 在触发回滚与服务重启前先将失败摘要落盘，确保接管的守护进程（含 Linux systemctl --user restart）启动即读到错误详情
+      const rollbackOk = recoverAfterFailedHandoff(handoffFailMsg, { precomputedPostIntegrity: postIntegrity });
       cleanupStaging();
+      releaseLockOnce();
       console.error(
         JSON.stringify(
           {
             ok: false,
+            error: handoffFailMsg,
             upgraded: false,
             rolledBack: rollbackOk,
             fromVersion,
             attemptedVersion: toVersion,
             handoffExitCode: handoffRes.status,
+            ...(handoffRes.signal ? { handoffSignal: handoffRes.signal } : {}),
             postIntegrity,
             postLiveOk,
+            ...(postLiveCheck ? { liveVerification: postLiveCheck } : {}),
             postLiveReport,
             stderr: String(handoffRes.stderr || '').trim().slice(0, 600)
           },
@@ -4702,6 +5860,7 @@ async function runUpgrade() {
           coreIntegrity: postIntegrity,
           userPreserved: true,
           clientRestarted: false,
+          ...(postLiveCheck ? { liveVerification: postLiveCheck } : {}),
           ...(postLiveReport ? { liveWindow: postLiveReport } : {})
         },
         null,
@@ -4709,12 +5868,17 @@ async function runUpgrade() {
       )
     );
   } catch (err) {
-    if (wrotePostUpgradeCache) {
-      writeUpdateCheckCache(targetDir, preUpgradeCacheSnapshot);
+    const rawErrMsg = err?.message || String(err);
+    const errMsg = persistUpgradeFailure(rawErrMsg);
+    let rolledBack = false;
+    if (handoffStarted) {
+      rolledBack = recoverAfterFailedHandoff(errMsg);
+    } else {
+      restoreRootFilesBackup();
     }
     cleanupStaging();
     releaseLockOnce();
-    console.error(JSON.stringify({ ok: false, error: err?.message || String(err) }, null, 2));
+    console.error(JSON.stringify({ ok: false, error: errMsg, ...(handoffStarted ? { rolledBack } : {}) }, null, 2));
     process.exit(1);
   }
 }
@@ -4723,8 +5887,8 @@ let _cachedWinSystemProxy = undefined;
 function detectWindowsSystemProxy() {
   if (process.platform !== 'win32') return null;
   if (_cachedWinSystemProxy !== undefined) return _cachedWinSystemProxy;
-  _cachedWinSystemProxy = null;
   if (hasProcessProxyEnv()) return null;
+  _cachedWinSystemProxy = null;
   try {
     const r = spawnSync(
       'reg',
@@ -4859,8 +6023,25 @@ async function downloadFontAsset(
   downloadDir,
   { force = false, preferredMirror = null, mirrorOrder = null } = {}
 ) {
+  const safeFilename = typeof asset?.filename === 'string' ? asset.filename : '';
+  if (
+    !safeFilename ||
+    safeFilename.includes('\0') ||
+    safeFilename.includes('..') ||
+    safeFilename.includes('/') ||
+    safeFilename.includes('\\') ||
+    path.basename(safeFilename) !== safeFilename
+  ) {
+    return {
+      ok: false,
+      id: asset?.id,
+      filename: asset?.filename,
+      error: `Unsafe asset filename "${asset?.filename ?? ''}"`,
+      attempts: []
+    };
+  }
   fs.mkdirSync(downloadDir, { recursive: true });
-  const finalPath = path.join(downloadDir, asset.filename);
+  const finalPath = path.join(downloadDir, safeFilename);
   if (!force && fs.existsSync(finalPath)) {
     const cachedCheck = validateDownloadedBinary(finalPath, asset);
     if (cachedCheck.ok) {
@@ -4900,11 +6081,16 @@ async function downloadFontAsset(
       }
     };
 
+    const isLoopbackMirror = isLoopbackHttpUrl(mirror.url);
+    const hasEnvProxy = isLoopbackMirror ? false : hasProcessProxyEnv();
+    const winProxy = isLoopbackMirror || hasEnvProxy ? null : detectWindowsSystemProxy();
+    const hasEffectiveProxy = Boolean(!isLoopbackMirror && (hasEnvProxy || winProxy));
+    let curlMissing = false;
+    let curlFailedOverProxy = false;
+
     // Strategy 1: curl / curl.exe（跨平台原生支持 HTTP_PROXY/HTTPS_PROXY，Windows 下自动探测系统注册表代理）
     try {
       const curlBin = process.platform === 'win32' ? 'curl.exe' : 'curl';
-      const isLoopbackMirror = isLoopbackHttpUrl(mirror.url);
-      const winProxy = isLoopbackMirror ? null : detectWindowsSystemProxy();
       const curlArgs = [
         '-fSL',
         '--retry',
@@ -4925,6 +6111,9 @@ async function downloadFontAsset(
         windowsHide: true,
         timeout: (timeoutSec + 15) * 1000
       });
+      if (r?.error && r.error.code === 'ENOENT') {
+        curlMissing = true;
+      }
       if (r.status === 0 && !r.error) {
         const chk = validateDownloadedBinary(partPath, asset);
         if (chk.ok) {
@@ -4945,6 +6134,9 @@ async function downloadFontAsset(
         }
         recordAttemptAndCheckBreak({ method: 'curl', ok: false, ...chk });
       } else {
+        if (!curlMissing && r.status !== 0) {
+          curlFailedOverProxy = true;
+        }
         recordAttemptAndCheckBreak({
           method: 'curl',
           ok: false,
@@ -4953,13 +6145,17 @@ async function downloadFontAsset(
         });
       }
     } catch (err) {
+      if (err?.code === 'ENOENT') curlMissing = true;
       recordAttemptAndCheckBreak({ method: 'curl', ok: false, error: String(err?.message || err).slice(0, 240) });
     }
     cleanupPart();
     if (mirrorCircuitBroken) continue;
 
+    const skipFetchOverProxy = !isLoopbackMirror && hasEffectiveProxy && !curlMissing;
+    const skipWinPsOverProxy = skipFetchOverProxy && (hasEnvProxy || curlFailedOverProxy);
+
     // Strategy 2 (Windows): PowerShell .NET HttpClient（原生继承 WinINET/PAC/系统代理与 TLS 1.2+，流式落盘零高内存）
-    if (process.platform === 'win32') {
+    if (process.platform === 'win32' && !skipWinPsOverProxy) {
       const cfgTmp = path.join(os.tmpdir(), `ag-dl-cfg-${process.pid}-${Date.now()}.json`);
       try {
         fs.writeFileSync(cfgTmp, JSON.stringify({ url: mirror.url, out: partPath, timeoutSec }), 'utf8');
@@ -5032,6 +6228,9 @@ async function downloadFontAsset(
       cleanupPart();
       if (mirrorCircuitBroken) continue;
     }
+
+    // 显式代理或 Windows 系统代理存在且 curl 可用时，跳过会忽略代理或超时阻塞的 node-fetch，立即切换下一个镜像
+    if (skipFetchOverProxy) continue;
 
     // Strategy 3: Node 22+ 原生 fetch 流式下载兜底
     try {
@@ -5798,19 +6997,29 @@ async function runUninstall() {
 // ============================================================================
 switch (subcommand) {
   case 'build-manifest': {
-    const m = buildManifest(__dirname);
-    console.log('Built core/manifest.json:', m.version, 'files:', Object.keys(m.files).length);
+    try {
+      const m = buildManifest(__dirname);
+      console.log('Built core/manifest.json:', m.version, 'files:', Object.keys(m.files).length);
+    } catch (err) {
+      console.error('[ERROR]', err?.message || err);
+      process.exit(1);
+    }
     break;
   }
   case 'pack': {
-    const packed = buildDistZip(__dirname, { updateBundleOnly: hasFlag('--update-bundle') });
-    console.log(
-      'Packed & verified dist archive:',
-      packed.zipPath,
-      `| core-update: ${packed.updateZipPath} (${packed.updateBytes}B)`,
-      `| latest.json: ${packed.latestJsonPath}`,
-      `(verified ${packed.filesVerified} core files)`
-    );
+    try {
+      const packed = buildDistZip(__dirname, { updateBundleOnly: hasFlag('--update-bundle') });
+      console.log(
+        'Packed & verified dist archive:',
+        packed.zipPath,
+        `| core-update: ${packed.updateZipPath} (${packed.updateBytes}B)`,
+        `| latest.json: ${packed.latestJsonPath}`,
+        `(verified ${packed.filesVerified} core files)`
+      );
+    } catch (err) {
+      console.error('[ERROR]', err?.message || err);
+      process.exit(1);
+    }
     break;
   }
   case 'doctor':
@@ -5856,7 +7065,7 @@ switch (subcommand) {
   node install.mjs verify           [--safe-mode] [--channel auto|stable|insiders]
   node install.mjs rollback
   node install.mjs uninstall
-  node install.mjs build-manifest
-  node install.mjs pack             [--update-bundle]`);
+  node install.mjs build-manifest   [--set-version <X.Y.Z>]
+  node install.mjs pack             [--update-bundle] [--set-version <X.Y.Z>]`);
     break;
 }

@@ -63,7 +63,7 @@ description: 船板的 Antigravity 2.0 主题、字体与汉化补丁（v6.0.6 �
 
 ```text
 chuanban-antigravity-theme-patch/
-├── install.mjs                 # 生命周期 CLI（install / relaunch / download-fonts / install-fonts / doctor / verify / rollback / uninstall / pack）
+├── install.mjs                 # 生命周期 CLI（install / upgrade / relaunch / download-fonts / install-fonts / doctor / verify / rollback / uninstall / pack）
 ├── SKILL.md                    # 面向 AI Agent 的部署与二次改装契约（本文件）
 ├── README.md                   # 面向用户的项目说明与快速上手指南
 ├── CHANGELOG.md                # 版本演进记录

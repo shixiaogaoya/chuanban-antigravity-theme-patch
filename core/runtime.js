@@ -105,6 +105,21 @@
       window.__ag_skip_non_host = false;
     }
   }
+  try {
+    delete window.__ag_patch_version;
+  } catch (e) {
+    window.__ag_patch_version = null;
+  }
+
+  function clearUpdateCopyTimer() {
+    if (window.__ag_update_copy_timer) {
+      try {
+        clearTimeout(window.__ag_update_copy_timer);
+      } catch (e) {}
+      window.__ag_update_copy_timer = null;
+    }
+  }
+  clearUpdateCopyTimer();
 
   const PATCH_VERSION = boot.version || '20261127-v6.0.6';
   const DETECTED_OS =
@@ -135,7 +150,6 @@
   let currentUpdateStatus =
     !IS_SWARM_PLUGIN_FRAME && boot.updateStatus && typeof boot.updateStatus === 'object' ? boot.updateStatus : null;
   let updateChangelogOpen = false;
-  let updateCopyTimer = null;
   let updateCopyDone = false;
 
   const DEFAULT_PRESET = boot.preset || 'morandi';
@@ -189,6 +203,7 @@
       updateUpgradeNowBtn: '立即热升级',
       updateUpgradingBtn: '正在热升级…',
       updateErrorPrefix: '升级未完成：',
+      updateCheckFailedNote: '检查更新失败，请确认网络或代理连接',
       updateShowNewBtn: '查看新版',
       updateCopyCmdBtn: '复制升级命令',
       updateCopiedBtn: '已复制 ✓',
@@ -237,6 +252,7 @@
       updateUpgradeNowBtn: '今すぐ更新',
       updateUpgradingBtn: '更新中…',
       updateErrorPrefix: '更新失敗：',
+      updateCheckFailedNote: '更新の確認に失敗しました。ネットワークまたはプロキシを確認してください',
       updateShowNewBtn: '詳細を見る',
       updateCopyCmdBtn: '更新コマンドをコピー',
       updateCopiedBtn: 'コピー済み ✓',
@@ -284,6 +300,7 @@
     updateUpgradeNowBtn: 'Upgrade Now',
     updateUpgradingBtn: 'Upgrading…',
     updateErrorPrefix: 'Upgrade failed: ',
+    updateCheckFailedNote: 'Update check failed. Check your network or proxy connection.',
     updateShowNewBtn: 'View Update',
     updateCopyCmdBtn: 'Copy Upgrade Cmd',
     updateCopiedBtn: 'Copied ✓',
@@ -792,6 +809,11 @@
 
   // 若用户在 user/config.json 中将 enabled 设为 false，执行无损卸载还原
   if (!ENABLED) {
+    try {
+      delete window.__ag_patch_version;
+    } catch (e) {
+      window.__ag_patch_version = null;
+    }
     const s0f = document.getElementById('ag-font-faces');
     if (s0f) s0f.remove();
     const s1 = document.getElementById('ag-custom-fonts');
@@ -844,6 +866,7 @@
       } catch (e) {}
       window.__ag_theme_btn_tt_timer = null;
     }
+    clearUpdateCopyTimer();
     if (window.__ag_appearance_toggle_observer) {
       try {
         window.__ag_appearance_toggle_observer.disconnect();
@@ -1120,6 +1143,11 @@
     return;
   }
 
+  try {
+    delete window.__ag_patch_version;
+  } catch (e) {
+    window.__ag_patch_version = null;
+  }
   if (window.__ag_disabled_dcl_fn && typeof document.removeEventListener === 'function') {
     document.removeEventListener('DOMContentLoaded', window.__ag_disabled_dcl_fn);
     window.__ag_disabled_dcl_fn = null;
@@ -2403,7 +2431,6 @@
   }
 
   syncChuanbanPreset();
-  window.__ag_patch_version = PATCH_VERSION;
 
   // ============================================================================
   // 3.2 外观界面「主题模式」四段式胶囊：在浅色(☀️)与深色(🌙)间无损挂载「暖纸深色(📖)」书卷按钮
@@ -3541,8 +3568,10 @@
       const baseRowClass =
         baseThemeRow?.className || 'py-2 px-3 w-full bg-transparent flex justify-between gap-4 items-center';
       const hasActiveUpdate = Boolean(st.updateAvailable && !st.dismissed && st.latestVersion);
+      const clItems = Array.isArray(st.changelog) ? st.changelog : [];
       const sig = JSON.stringify({
-        lang: isUiEnglish() ? 'en' : 'zh',
+        lang: isUiEnglish() ? 'en' : INSTALLED_LOCALE,
+        cls: baseRowClass,
         cur: st.currentVersion || '',
         lat: st.latestVersion || '',
         avail: Boolean(st.updateAvailable),
@@ -3555,12 +3584,24 @@
         chk: Boolean(st.checking),
         upg: Boolean(st.upgrading),
         err: st.upgradeError || '',
+        cerr: st.checkError || '',
         cat: st.checkedAt || '',
         bytes: st.bundleBytes || 0,
-        clLen: Array.isArray(st.changelog) ? st.changelog.length : 0,
+        src: st.source || '',
+        rel: st.releaseUrl || '',
+        cmd: st.upgradeCommand || '',
+        cl: clItems,
         open: Boolean(updateChangelogOpen),
         copied: Boolean(updateCopyDone)
       });
+
+      const appendCheckErrorLine = (parent) => {
+        const errLine = document.createElement('div');
+        errLine.className = 'ag-patch-update-error';
+        errLine.setAttribute('data-ag-check-error', '1');
+        errLine.textContent = uiStr.updateCheckFailedNote;
+        parent.appendChild(errLine);
+      };
 
       if (!row) {
         row = document.createElement('div');
@@ -3577,7 +3618,6 @@
       if (row.getAttribute('data-ag-update-sig') === sig) return;
       row.setAttribute('data-ag-update-sig', sig);
 
-      const clItems = Array.isArray(st.changelog) ? st.changelog : [];
       const hasChangelog = clItems.length > 0;
       row.className = hasActiveUpdate ? `${baseRowClass} ag-patch-update-row--stacked` : baseRowClass;
       row.innerHTML = '';
@@ -3669,14 +3709,13 @@
           updateCopyDone = true;
           row.removeAttribute('data-ag-update-sig');
           syncAppearanceUpdateRowOnCard(card, baseThemeRow);
-          if (updateCopyTimer) clearTimeout(updateCopyTimer);
-          updateCopyTimer = setTimeout(() => {
+          clearUpdateCopyTimer();
+          window.__ag_update_copy_timer = setTimeout(() => {
             updateCopyDone = false;
-            updateCopyTimer = null;
-            if (row.isConnected) {
-              row.removeAttribute('data-ag-update-sig');
-              syncAppearanceUpdateRowOnCard(card, baseThemeRow);
-            }
+            window.__ag_update_copy_timer = null;
+            if (!row.isConnected) return;
+            row.removeAttribute('data-ag-update-sig');
+            syncAppearanceUpdateRowOnCard(card, baseThemeRow);
           }, 1800);
         });
         actions.appendChild(copyBtn);
@@ -3713,6 +3752,8 @@
           errLine.className = 'ag-patch-update-error';
           errLine.textContent = `${uiStr.updateErrorPrefix}${st.upgradeError}`;
           row.appendChild(errLine);
+        } else if (st.checkError && !st.checking && !st.upgrading) {
+          appendCheckErrorLine(row);
         }
 
         if (hasChangelog && updateChangelogOpen) {
@@ -3779,6 +3820,9 @@
           desc.textContent = checkedTime ? `${uiStr.updateCheckedPrefix}${checkedTime}` : uiStr.updateNotChecked;
         }
         leftCol.appendChild(desc);
+        if (st.checkError && !st.checking && !st.upgrading) {
+          appendCheckErrorLine(leftCol);
+        }
 
         const rightCol = document.createElement('div');
         rightCol.className = 'ag-patch-update-right shrink-0 flex items-center gap-1.5';
@@ -3798,6 +3842,7 @@
           const showBtn = document.createElement('button');
           showBtn.type = 'button';
           showBtn.className = 'ag-patch-update-btn';
+          showBtn.disabled = Boolean(st.checking || st.upgrading);
           showBtn.textContent = uiStr.updateShowNewBtn;
           showBtn.addEventListener('click', (ev) => {
             ev.preventDefault();
@@ -3810,7 +3855,7 @@
         const checkBtn = document.createElement('button');
         checkBtn.type = 'button';
         checkBtn.className = 'ag-patch-update-btn';
-        checkBtn.disabled = Boolean(st.checking);
+        checkBtn.disabled = Boolean(st.checking || st.upgrading);
         checkBtn.textContent = st.checking ? uiStr.updateCheckingBtn : uiStr.updateCheckBtn;
         checkBtn.addEventListener('click', (ev) => {
           ev.preventDefault();
@@ -3832,8 +3877,6 @@
         const themeRow = g.closest ? g.closest('.agy-card > div') : null;
         const card = themeRow ? themeRow.parentElement : null;
         if (card) {
-          const existingRow = card.querySelector('[data-ag-patch-update-row="1"]');
-          if (existingRow) existingRow.removeAttribute('data-ag-update-sig');
           syncAppearanceUpdateRowOnCard(card, themeRow);
         }
       }
@@ -11502,6 +11545,9 @@
     cleanupContextMenuDom();
   }
   /* __AG_CONTEXT_MENU_JS_END__ */
+
+  // 全部核心模块均无异常完成后再写入运行态版本戳（确保热升级后实时窗口校验不会因半截异常而误判通过）
+  window.__ag_patch_version = PATCH_VERSION;
 
   // ============================================================================
   // 5. 开放用户自定义前端脚本钩子 (user/custom.js，沙箱异常隔离，同时提供 ctx 与 boot)

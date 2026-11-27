@@ -450,8 +450,35 @@ function resolveChannelPaths(singleChannel = 'stable', userCfg = {}) {
   } catch {}
 
   const portFile = getArg('--port-file', userCfg.portFile || defaultPortFile);
+  let standardInstallExists = false;
+  if (process.platform === 'darwin') {
+    const bundleName = isInsiders ? 'Antigravity - Insiders.app' : 'Antigravity.app';
+    standardInstallExists =
+      fs.existsSync(path.join('/Applications', bundleName)) ||
+      fs.existsSync(path.join(home, 'Applications', bundleName));
+  } else if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+    const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
+    const exeName = isInsiders ? 'Antigravity - Insiders.exe' : 'Antigravity.exe';
+    standardInstallExists =
+      fs.existsSync(path.join(localAppData, 'Programs', appDirName, exeName)) ||
+      fs.existsSync(path.join(progFiles, appDirName, exeName));
+  } else {
+    const linuxDirs = isInsiders
+      ? [
+          '/usr/share/antigravity-insiders',
+          '/opt/Antigravity - Insiders',
+          '/opt/Antigravity-Insiders',
+          '/opt/antigravity-insiders'
+        ]
+      : ['/usr/share/antigravity', '/opt/Antigravity', '/opt/antigravity'];
+    standardInstallExists = linuxDirs.some((d) => fs.existsSync(d));
+  }
   const channelInstalled =
-    fs.existsSync(portFile) || fs.existsSync(path.dirname(defaultPortFile)) || fs.existsSync(dotDir);
+    fs.existsSync(portFile) ||
+    fs.existsSync(path.dirname(defaultPortFile)) ||
+    fs.existsSync(dotDir) ||
+    standardInstallExists;
   const explicitConvDir = getArg('--conversations-dir', userCfg.conversationsDir || '');
   const primaryConvDir = explicitConvDir || defaultConvDir;
 
@@ -473,13 +500,13 @@ function resolveActiveChannelEndpoints(channelMode = 'auto', userCfg = {}) {
   const explicitPortFile = getArg('--port-file', userCfg.portFile || '');
   if (explicitPortFile) {
     const ch = channelMode === 'insiders' ? 'insiders' : 'stable';
-    return [resolveChannelPaths(ch, userCfg)];
+    return [{ ...resolveChannelPaths(ch, userCfg), channelInstalled: true }];
   }
   if (channelMode === 'stable') {
-    return [resolveChannelPaths('stable', userCfg)];
+    return [{ ...resolveChannelPaths('stable', userCfg), channelInstalled: true }];
   }
   if (channelMode === 'insiders') {
-    return [resolveChannelPaths('insiders', userCfg)];
+    return [{ ...resolveChannelPaths('insiders', userCfg), channelInstalled: true }];
   }
   // 'auto' 或 'both'：同时轮询 Stable 与 Insiders 两个通道，互不抢占
   return [resolveChannelPaths('stable', userCfg), resolveChannelPaths('insiders', userCfg)];
@@ -488,7 +515,13 @@ function resolveActiveChannelEndpoints(channelMode = 'auto', userCfg = {}) {
 // ============================================================================
 // 2. 动态构建注入载荷（支持 core/ + user/ 实时合并与热更新签名）
 // ============================================================================
-const BASE_VERSION = '20261127-v6.0.6';
+const MANIFEST_SEMVER = (() => {
+  const m = readJsonSafe(path.join(CORE_DIR, 'manifest.json'), null);
+  return m && typeof m.version === 'string' && m.version.trim()
+    ? m.version.trim().replace(/^v/i, '')
+    : '6.0.6';
+})();
+const BASE_VERSION = `20261127-v${MANIFEST_SEMVER}`;
 let cachedBundleSig = '';
 let cachedInjectScript = '';
 let cachedIframeInjectScript = '';
@@ -499,7 +532,7 @@ const UPDATE_UPGRADE_LOG_FILE = path.join(CACHE_DIR, 'last-upgrade.log');
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_CHECK_ERROR_BACKOFF_MS = 60 * 60 * 1000;
 const UPDATE_MANUAL_COOLDOWN_MS = 2000;
-const UPDATE_UPGRADE_COOLDOWN_MS = 10000;
+const UPDATE_UPGRADE_COOLDOWN_MS = 2000;
 const UPDATE_UPGRADE_TIMEOUT_MS = 360000;
 const UPDATE_HOST_VERSION_TTL_MS = 10 * 60 * 1000;
 const UPDATE_INITIAL_DELAY_MS = 30 * 1000;
@@ -513,8 +546,9 @@ let lastManualUpdateCheckAt = 0;
 let lastUpgradeTriggerAt = 0;
 let lastUpdateErrorAt = 0;
 let lastUpgradeError = '';
+let lastManualCheckError = '';
 let updateUpgradeWatchdog = null;
-let cachedHostAppVersion = { version: null, probedAt: 0, promise: null };
+let cachedHostAppVersion = { version: null, channel: 'auto', probedAt: 0, promise: null };
 let updateCheckState = {
   loaded: false,
   checkedAt: null,
@@ -524,6 +558,8 @@ let updateCheckState = {
   minNodeVersion: null,
   hostAppVersion: null,
   dismissedVersion: null,
+  upgradeError: null,
+  upgradeFailedVersion: null,
   changelog: [],
   bundleBytes: null,
   releaseUrl: UPDATE_OFFICIAL_GH_LATEST_URL
@@ -592,91 +628,416 @@ function isPatchMinVersionSatisfied(currentVer, minVer) {
   return compareUpdateSemverTuples(cur, min) >= 0;
 }
 
-async function resolveHostAppVersionAsync({ force = false } = {}) {
+function pickMinDaemonHostVersion(versions) {
+  const clean = [];
+  for (const raw of versions) {
+    const v = typeof raw === 'string' ? raw.trim() : '';
+    if (v) clean.push(v);
+  }
+  if (clean.length === 0) return null;
+  if (clean.length === 1) return clean[0];
+  let best = clean[0];
+  let bestTuple = extractUpdateSemverTuple(best);
+  for (let i = 1; i < clean.length; i++) {
+    const cur = clean[i];
+    const curTuple = extractUpdateSemverTuple(cur);
+    if (curTuple && bestTuple) {
+      if (compareUpdateSemverTuples(curTuple, bestTuple) < 0) {
+        best = cur;
+        bestTuple = curTuple;
+      }
+    } else if (curTuple && !bestTuple) {
+      best = cur;
+      bestTuple = curTuple;
+    }
+  }
+  return best;
+}
+
+function extractDaemonLinuxDesktopExecBinary(rawDesktop) {
+  const lines = String(rawDesktop || '').split(/\r?\n/);
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const m = trimmed.match(/^Exec\s*=\s*(.+)$/);
+    if (!m) continue;
+    const rhs = m[1].trim();
+    const tokens = [];
+    let cur = '';
+    let quote = '';
+    for (let i = 0; i < rhs.length; i++) {
+      const ch = rhs[i];
+      if (quote) {
+        if (ch === '\\' && i + 1 < rhs.length) {
+          cur += rhs[++i];
+        } else if (ch === quote) {
+          quote = '';
+        } else {
+          cur += ch;
+        }
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '\\' && i + 1 < rhs.length) {
+        cur += rhs[++i];
+      } else if (/\s/.test(ch)) {
+        if (cur.length > 0) {
+          tokens.push(cur);
+          cur = '';
+        }
+      } else {
+        cur += ch;
+      }
+    }
+    if (cur.length > 0) tokens.push(cur);
+
+    let idx = 0;
+    while (idx < tokens.length) {
+      const tok = tokens[idx];
+      if (/^(?:\/usr\/bin\/|\/bin\/)?env$/.test(tok)) {
+        idx++;
+        while (idx < tokens.length) {
+          const envArg = tokens[idx];
+          if (envArg === '-u' || envArg === '--unset') {
+            idx += 2;
+          } else if (envArg === '--') {
+            idx++;
+            break;
+          } else if (envArg.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(envArg)) {
+            idx++;
+          } else {
+            break;
+          }
+        }
+        continue;
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok) || /^%[fFuUdDnNickvm%]$/.test(tok)) {
+        idx++;
+        continue;
+      }
+      return tok;
+    }
+  }
+  return '';
+}
+
+async function resolveHostAppVersionAsync({ force = false, channel = null } = {}) {
+  const effectiveChannel = channel || CLI_CHANNEL || activeConfig?.channel || 'auto';
+  const allowStable = effectiveChannel !== 'insiders';
+  const allowInsiders = effectiveChannel !== 'stable';
   const now = Date.now();
-  if (!force && cachedHostAppVersion.probedAt > 0 && now - cachedHostAppVersion.probedAt < UPDATE_HOST_VERSION_TTL_MS) {
+  if (
+    !force &&
+    cachedHostAppVersion.probedAt > 0 &&
+    cachedHostAppVersion.channel === effectiveChannel &&
+    now - cachedHostAppVersion.probedAt < UPDATE_HOST_VERSION_TTL_MS
+  ) {
     return cachedHostAppVersion.version;
   }
-  if (cachedHostAppVersion.promise) return cachedHostAppVersion.promise;
+  if (!force && cachedHostAppVersion.promise && cachedHostAppVersion.channel === effectiveChannel) {
+    return cachedHostAppVersion.promise;
+  }
 
   const p = (async () => {
     const home = os.homedir();
     let detected = null;
     try {
       if (process.platform === 'darwin') {
-        const candidates = [
-          '/Applications/Antigravity.app/Contents/Info.plist',
-          path.join(home, 'Applications', 'Antigravity.app', 'Contents', 'Info.plist'),
-          '/Applications/Antigravity - Insiders.app/Contents/Info.plist',
-          path.join(home, 'Applications', 'Antigravity - Insiders.app', 'Contents', 'Info.plist')
-        ];
-        for (const plist of candidates) {
-          if (!fs.existsSync(plist)) continue;
-          const xml = fs.readFileSync(plist, 'utf8');
-          const m = xml.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
-          if (m && m[1]) {
-            detected = m[1].trim();
-            break;
+        const readPlistVer = (plistPath) => {
+          if (!plistPath || !fs.existsSync(plistPath)) return null;
+          try {
+            const xml = fs.readFileSync(plistPath, 'utf8');
+            const m = xml.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
+            if (m && m[1]) return m[1].trim();
+          } catch {}
+          return null;
+        };
+        const psRes = await execFileAsync('ps', ['-axo', 'pid=,command='], 2500);
+        if (psRes.ok && psRes.stdout) {
+          const procVers = [];
+          for (const line of String(psRes.stdout).split(/\r?\n/)) {
+            const m = line.trim().match(/^(\d+)\s+(.+)$/);
+            if (!m) continue;
+            const cmd = m[2];
+            if (
+              /--type=|--crashpad|--utility-sub-type=|--import=|sidecar_sdk|--ms-enable-electron-run-as-node/i.test(cmd) ||
+              /Helper(?:\s|\.|\/)/i.test(cmd)
+            ) {
+              continue;
+            }
+            const appMatch = cmd.match(
+              /^"?(\/[^\r\n"]*?\/Antigravity(?:\s-\sInsiders)?\.app)\/Contents\/MacOS\/(Antigravity(?:\s-\sInsiders)?)"?(?:\s|$)/
+            );
+            if (!appMatch) continue;
+            const ch = /Insiders/i.test(appMatch[2]) ? 'insiders' : 'stable';
+            if ((ch === 'stable' && !allowStable) || (ch === 'insiders' && !allowInsiders)) continue;
+            const ver = readPlistVer(path.join(appMatch[1], 'Contents', 'Info.plist'));
+            if (ver) procVers.push(ver);
           }
+          detected = pickMinDaemonHostVersion(procVers);
+        }
+        if (!detected) {
+          const candidates = [
+            ...(allowStable
+              ? [
+                  '/Applications/Antigravity.app/Contents/Info.plist',
+                  path.join(home, 'Applications', 'Antigravity.app', 'Contents', 'Info.plist')
+                ]
+              : []),
+            ...(allowInsiders
+              ? [
+                  '/Applications/Antigravity - Insiders.app/Contents/Info.plist',
+                  path.join(home, 'Applications', 'Antigravity - Insiders.app', 'Contents', 'Info.plist')
+                ]
+              : [])
+          ];
+          detected = pickMinDaemonHostVersion(candidates.map((plist) => readPlistVer(plist)));
         }
       } else if (process.platform === 'linux') {
-        const candidates = [
-          '/usr/share/antigravity/resources/app/package.json',
-          '/opt/Antigravity/resources/app/package.json',
-          '/usr/share/antigravity-insiders/resources/app/package.json'
-        ];
-        for (const pkgPath of candidates) {
-          if (!fs.existsSync(pkgPath)) continue;
+        const readPkgVer = (pkgPath) => {
+          if (!pkgPath || !fs.existsSync(pkgPath)) return null;
           const pkg = readJsonSafe(pkgPath, null);
-          if (pkg && typeof pkg.version === 'string' && pkg.version.trim()) {
-            detected = pkg.version.trim();
-            break;
+          return pkg && typeof pkg.version === 'string' && pkg.version.trim() ? pkg.version.trim() : null;
+        };
+        const resolveLinuxExe = (rawExe) => {
+          const token = String(rawExe || '').trim().replace(/\s+\(deleted\)$/, '');
+          if (!token) return '';
+          if (token.startsWith('/')) return token;
+          if (token.includes('/')) return '';
+          const searchDirs = [
+            ...String(process.env.PATH || '').split(':'),
+            path.join(home, '.local', 'bin'),
+            '/usr/local/bin',
+            '/usr/bin',
+            '/bin',
+            '/snap/bin'
+          ];
+          for (const dir of searchDirs) {
+            if (!dir) continue;
+            const cand = path.join(dir, token);
+            if (fs.existsSync(cand)) return cand;
           }
+          return '';
+        };
+        const probeFromExe = (rawExe) => {
+          const exe = resolveLinuxExe(rawExe);
+          if (!exe || !exe.startsWith('/')) return null;
+          let realExe = exe;
+          try {
+            if (fs.existsSync(exe)) realExe = fs.realpathSync(exe);
+          } catch {}
+          const isIns = /insiders/i.test(exe) || /insiders/i.test(realExe);
+          const appFolder = isIns ? 'antigravity-insiders' : 'antigravity';
+          for (const baseDir of Array.from(new Set([path.dirname(realExe), path.dirname(exe)]))) {
+            const rels = [
+              path.join(baseDir, 'resources', 'app', 'package.json'),
+              path.join(baseDir, '..', 'resources', 'app', 'package.json'),
+              path.join(baseDir, '..', 'share', appFolder, 'resources', 'app', 'package.json'),
+              path.join(baseDir, '..', 'lib', appFolder, 'resources', 'app', 'package.json')
+            ];
+            for (const cand of rels) {
+              const ver = readPkgVer(cand);
+              if (ver) return ver;
+            }
+          }
+          return null;
+        };
+        const userAppsDir = path.join(home, '.local', 'share', 'applications');
+        const probeChannelStaticVers = (ch) => {
+          const isIns = ch === 'insiders';
+          const pkgPaths = isIns
+            ? [
+                '/usr/share/antigravity-insiders/resources/app/package.json',
+                '/opt/Antigravity - Insiders/resources/app/package.json',
+                '/opt/Antigravity-Insiders/resources/app/package.json',
+                '/opt/antigravity-insiders/resources/app/package.json'
+              ]
+            : [
+                '/usr/share/antigravity/resources/app/package.json',
+                '/opt/Antigravity/resources/app/package.json',
+                '/opt/antigravity/resources/app/package.json'
+              ];
+          const found = [];
+          for (const pkgPath of pkgPaths) {
+            const ver = readPkgVer(pkgPath);
+            if (ver) found.push(ver);
+          }
+          if (found.length > 0) return found;
+          const desktopName = isIns ? 'antigravity-insiders.desktop' : 'antigravity.desktop';
+          for (const dir of [userAppsDir, '/usr/share/applications']) {
+            const dp = path.join(dir, desktopName);
+            if (!fs.existsSync(dp)) continue;
+            try {
+              const raw = fs.readFileSync(dp, 'utf8');
+              const ver = probeFromExe(extractDaemonLinuxDesktopExecBinary(raw));
+              if (ver) {
+                found.push(ver);
+                break;
+              }
+            } catch {}
+          }
+          return found;
+        };
+        const psRes = await execFileAsync('ps', ['-axo', 'pid=,command='], 2500);
+        if (psRes.ok && psRes.stdout) {
+          const procVers = [];
+          for (const line of String(psRes.stdout).split(/\r?\n/)) {
+            const m = line.trim().match(/^(\d+)\s+(.+)$/);
+            if (!m) continue;
+            const pid = parseInt(m[1], 10);
+            const cmd = m[2];
+            if (
+              !pid ||
+              /--type=|--crashpad|--utility-sub-type=|--import=|sidecar_sdk|--ms-enable-electron-run-as-node|daemon\.mjs|install\.mjs/i.test(
+                cmd
+              )
+            ) {
+              continue;
+            }
+            const binMatch = cmd.match(
+              /^(?:"((?:[^"\r\n]*\/)?antigravity(?:-insiders)?)"|'((?:[^'\r\n]*\/)?antigravity(?:-insiders)?)'|(\/(?:[^\s"']|\s-\sinsiders)*\/antigravity(?:-insiders)?)|(antigravity(?:-insiders)?))(?=\s+(?!-\s*insiders(?:\/|\s|$))|$)/i
+            );
+            let matchedExe = binMatch ? binMatch[1] || binMatch[2] || binMatch[3] || binMatch[4] || '' : '';
+            let procLinkExe = '';
+            if (typeof fs.readlinkSync === 'function') {
+              try {
+                const linkTarget = String(fs.readlinkSync(`/proc/${pid}/exe`) || '').replace(/\s+\(deleted\)$/, '');
+                if (/\/antigravity(?:-insiders)?$/i.test(linkTarget)) {
+                  procLinkExe = linkTarget;
+                  if (!matchedExe) matchedExe = linkTarget;
+                }
+              } catch {}
+            }
+            if (!matchedExe) continue;
+            const resolvedExe = resolveLinuxExe(procLinkExe || matchedExe) || procLinkExe || matchedExe;
+            const ch = /insiders/i.test(procLinkExe || resolvedExe || matchedExe) ? 'insiders' : 'stable';
+            if ((ch === 'stable' && !allowStable) || (ch === 'insiders' && !allowInsiders)) continue;
+            const ver =
+              probeFromExe(procLinkExe || resolvedExe || matchedExe) ||
+              pickMinDaemonHostVersion(probeChannelStaticVers(ch));
+            if (ver) procVers.push(ver);
+          }
+          detected = pickMinDaemonHostVersion(procVers);
+        }
+        if (!detected) {
+          const staticVers = [
+            ...(allowStable ? probeChannelStaticVers('stable') : []),
+            ...(allowInsiders ? probeChannelStaticVers('insiders') : [])
+          ];
+          detected = pickMinDaemonHostVersion(staticVers);
         }
       } else if (process.platform === 'win32') {
         const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
         const progFiles = process.env.ProgramFiles || 'C:\\Program Files';
         const exeCandidates = [
-          path.join(localAppData, 'Programs', 'Antigravity', 'Antigravity.exe'),
-          path.join(progFiles, 'Antigravity', 'Antigravity.exe'),
-          path.join(localAppData, 'Programs', 'Antigravity - Insiders', 'Antigravity - Insiders.exe')
+          ...(allowStable
+            ? [
+                path.join(localAppData, 'Programs', 'Antigravity', 'Antigravity.exe'),
+                path.join(progFiles, 'Antigravity', 'Antigravity.exe')
+              ]
+            : []),
+          ...(allowInsiders
+            ? [
+                path.join(localAppData, 'Programs', 'Antigravity - Insiders', 'Antigravity - Insiders.exe'),
+                path.join(progFiles, 'Antigravity - Insiders', 'Antigravity - Insiders.exe')
+              ]
+            : [])
         ];
-        const existingExe = exeCandidates.find((exe) => fs.existsSync(exe)) || '';
-        if (existingExe) {
-          const ps = `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; (Get-Item -LiteralPath '${existingExe.replace(/'/g, "''")}').VersionInfo.ProductVersion`;
-          const r = await execFileAsync(
-            'powershell',
-            ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps],
-            3000
-          );
-          if (r.ok && r.stdout.trim()) {
-            detected = r.stdout.trim();
-          }
+        const existingExes = exeCandidates.filter((exe) => fs.existsSync(exe));
+        const psExeList = existingExes.map((exe) => `'${exe.replace(/'/g, "''")}'`).join(', ');
+        const ps = [
+          `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`,
+          `$ErrorActionPreference = 'SilentlyContinue'`,
+          `$staticVers = @()`,
+          existingExes.length > 0
+            ? `$staticVers = @(foreach ($ep in @(${psExeList})) { try { $sv = [string](Get-Item -LiteralPath $ep -ErrorAction Stop).VersionInfo.ProductVersion; if ($sv) { $sv } } catch {} })`
+            : '',
+          `$procs = @()`,
+          `try { $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'Antigravity.exe' OR Name = 'Antigravity - Insiders.exe'" -ErrorAction Stop | Where-Object { $_.CommandLine -notmatch '--type=|--crashpad|--utility-sub-type=|--import=|sidecar_sdk|--ms-enable-electron-run-as-node' } | ForEach-Object { $ep = [string]$_.ExecutablePath; $pv = ''; if ($ep) { try { $pv = [string](Get-Item -LiteralPath $ep -ErrorAction Stop).VersionInfo.ProductVersion } catch {} }; @{ name = [string]$_.Name; exe = $ep; ver = $pv } }) } catch {}`,
+          `if ($procs.Count -eq 0) { $byName = Get-Process -Name 'Antigravity','Antigravity - Insiders' -ErrorAction SilentlyContinue | Group-Object ProcessName; $procs = @(foreach ($g in $byName) { $p = $g.Group | Select-Object -First 1; if ($null -ne $p) { $ep = ''; $pv = ''; try { $ep = [string]$p.Path; if ($ep) { $pv = [string](Get-Item -LiteralPath $ep -ErrorAction Stop).VersionInfo.ProductVersion } } catch {}; @{ name = ([string]$p.ProcessName + '.exe'); exe = $ep; ver = $pv } } }) }`,
+          `@{ staticVers = $staticVers; procs = $procs } | ConvertTo-Json -Compress -Depth 3`
+        ]
+          .filter(Boolean)
+          .join('; ');
+        const r = await execFileAsync(
+          'powershell',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+          4000
+        );
+        if (r.ok && r.stdout.trim()) {
+          try {
+            const parsed = JSON.parse(r.stdout.trim());
+            const rawProcs = Array.isArray(parsed.procs) ? parsed.procs : parsed.procs ? [parsed.procs] : [];
+            const procVers = [];
+            for (const pInfo of rawProcs) {
+              const ch = /insiders/i.test(pInfo?.name || pInfo?.exe || '') ? 'insiders' : 'stable';
+              if ((ch === 'stable' && !allowStable) || (ch === 'insiders' && !allowInsiders)) continue;
+              if (typeof pInfo?.ver === 'string' && pInfo.ver.trim()) {
+                procVers.push(pInfo.ver.trim());
+              }
+            }
+            detected = pickMinDaemonHostVersion(procVers);
+            if (!detected) {
+              const rawStaticVers = Array.isArray(parsed.staticVers)
+                ? parsed.staticVers
+                : parsed.staticVers
+                ? [parsed.staticVers]
+                : [];
+              detected = pickMinDaemonHostVersion(rawStaticVers);
+            }
+          } catch {}
         }
       }
     } catch {}
-    cachedHostAppVersion = { version: detected, probedAt: Date.now(), promise: null };
+    cachedHostAppVersion = { version: detected, channel: effectiveChannel, probedAt: Date.now(), promise: null };
     return detected;
   })();
 
+  cachedHostAppVersion.channel = effectiveChannel;
   cachedHostAppVersion.promise = p;
   return p;
 }
 
 let lastObservedUpdateDiskSig = '';
 
+function getAtomicFileDiskSig(filePath) {
+  try {
+    const st = fs.statSync(filePath, { throwIfNoEntry: false });
+    return st ? `${st.mtimeMs}:${st.ctimeMs}:${st.ino}:${st.size}` : '0:0:0:0';
+  } catch {
+    return '0:0:0:0';
+  }
+}
+
 function computeUpdateDiskSig() {
-  return `${getFileMtimeSig(UPDATE_CACHE_FILE)}|${getFileMtimeSig(path.join(CORE_DIR, 'manifest.json'))}`;
+  return `${getAtomicFileDiskSig(UPDATE_CACHE_FILE)}|${getAtomicFileDiskSig(path.join(CORE_DIR, 'manifest.json'))}`;
 }
 
 function readUpdateCacheFromDisk() {
   const parsed = readJsonSafe(UPDATE_CACHE_FILE, null);
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const prevCheckedAt = typeof updateCheckState.checkedAt === 'string' ? updateCheckState.checkedAt.trim() : '';
+    const nextCheckedAt = typeof parsed.checkedAt === 'string' ? parsed.checkedAt.trim() : '';
+    if (nextCheckedAt && nextCheckedAt !== prevCheckedAt) {
+      const nextCheckedMs = Date.parse(nextCheckedAt);
+      const prevCheckedMs = prevCheckedAt ? Date.parse(prevCheckedAt) : NaN;
+      if (Number.isFinite(nextCheckedMs) && (!Number.isFinite(prevCheckedMs) || nextCheckedMs > prevCheckedMs)) {
+        lastManualCheckError = '';
+      }
+    }
+    const latestVer = typeof parsed.latestVersion === 'string' ? parsed.latestVersion.replace(/^v/i, '') : null;
+    const rawUpgradeError =
+      typeof parsed.upgradeError === 'string' && parsed.upgradeError.trim()
+        ? parsed.upgradeError.trim().slice(0, 140)
+        : null;
+    const rawUpgradeFailedVer =
+      typeof parsed.upgradeFailedVersion === 'string' && parsed.upgradeFailedVersion.trim()
+        ? parsed.upgradeFailedVersion.trim().replace(/^v/i, '')
+        : null;
     updateCheckState = {
       loaded: true,
       checkedAt: typeof parsed.checkedAt === 'string' ? parsed.checkedAt : null,
       source: typeof parsed.source === 'string' ? parsed.source : null,
-      latestVersion: typeof parsed.latestVersion === 'string' ? parsed.latestVersion.replace(/^v/i, '') : null,
+      latestVersion: latestVer,
       minAntigravityVersion:
         typeof parsed.minAntigravityVersion === 'string' && parsed.minAntigravityVersion.trim()
           ? parsed.minAntigravityVersion.trim()
@@ -686,6 +1047,8 @@ function readUpdateCacheFromDisk() {
       hostAppVersion:
         typeof parsed.hostAppVersion === 'string' && parsed.hostAppVersion.trim() ? parsed.hostAppVersion.trim() : null,
       dismissedVersion: typeof parsed.dismissedVersion === 'string' ? parsed.dismissedVersion.replace(/^v/i, '') : null,
+      upgradeError: rawUpgradeError,
+      upgradeFailedVersion: rawUpgradeFailedVer,
       changelog: Array.isArray(parsed.changelog) ? parsed.changelog.filter((s) => typeof s === 'string').slice(0, 6) : [],
       bundleBytes: Number.isFinite(Number(parsed.bundleBytes)) && Number(parsed.bundleBytes) > 0 ? Number(parsed.bundleBytes) : null,
       releaseUrl:
@@ -693,6 +1056,16 @@ function readUpdateCacheFromDisk() {
           ? parsed.releaseUrl
           : UPDATE_OFFICIAL_GH_LATEST_URL
     };
+    if (!updateUpgradeInFlight) {
+      const curVer = getInstalledCurrentVersion();
+      const stillRelevant = Boolean(
+        rawUpgradeError &&
+          latestVer &&
+          isPatchUpdateNewer(curVer, latestVer) &&
+          (!rawUpgradeFailedVer || rawUpgradeFailedVer === latestVer)
+      );
+      lastUpgradeError = stillRelevant ? rawUpgradeError : '';
+    }
   } else {
     updateCheckState.loaded = true;
   }
@@ -713,7 +1086,7 @@ function writeUpdateCacheAtomic(nextObj) {
   }
 }
 
-function syncUpdateDiskStateIfChanged() {
+function syncUpdateDiskStateIfChanged(opts = {}) {
   if (SAFE_MODE || RUN_ONCE || daemonExiting) return false;
   if (!updateCheckState.loaded) {
     readUpdateCacheFromDisk();
@@ -723,7 +1096,8 @@ function syncUpdateDiskStateIfChanged() {
   const curSig = computeUpdateDiskSig();
   if (curSig === lastObservedUpdateDiskSig) return false;
   readUpdateCacheFromDisk();
-  if (activeConfig?.enabled && activeConfig?.modules?.updateCheck !== false && attachedTargets.size > 0) {
+  cachedBundleSig = '';
+  if (!opts?.deferRebuild) {
     broadcastUpdateStatusToTargets(getPublicUpdateStatus());
   }
   return true;
@@ -744,7 +1118,12 @@ function getPublicUpdateStatus() {
   }
   const currentVersion = getInstalledCurrentVersion();
   const latestVersion = updateCheckState.latestVersion || null;
-  const hostAppVersion = cachedHostAppVersion.version || updateCheckState.hostAppVersion || null;
+  const effectiveHostChannel = CLI_CHANNEL || activeConfig?.channel || 'auto';
+  const freshCachedHostVer =
+    cachedHostAppVersion.probedAt > 0 && cachedHostAppVersion.channel === effectiveHostChannel
+      ? cachedHostAppVersion.version
+      : null;
+  const hostAppVersion = freshCachedHostVer || updateCheckState.hostAppVersion || null;
   const minAntigravityVersion = updateCheckState.minAntigravityVersion || null;
   const minNodeVersion = updateCheckState.minNodeVersion || null;
   const semverNewer = Boolean(latestVersion && isPatchUpdateNewer(currentVersion, latestVersion));
@@ -756,23 +1135,30 @@ function getPublicUpdateStatus() {
   const dismissedVersion = updateCheckState.dismissedVersion || null;
   const dismissed = Boolean(updateAvailable && dismissedVersion && dismissedVersion === latestVersion);
   const enabled = Boolean(activeConfig?.modules?.updateCheck !== false);
-  if (
-    !SAFE_MODE &&
-    !RUN_ONCE &&
-    enabled &&
-    minAntigravityVersion &&
-    cachedHostAppVersion.probedAt === 0 &&
-    !cachedHostAppVersion.promise
-  ) {
-    void resolveHostAppVersionAsync().then((ver) => {
-      if (ver && ver !== updateCheckState.hostAppVersion) {
+  const hostProbeNeeded =
+    cachedHostAppVersion.probedAt === 0 ||
+    cachedHostAppVersion.channel !== effectiveHostChannel ||
+    Date.now() - cachedHostAppVersion.probedAt >= UPDATE_HOST_VERSION_TTL_MS;
+  const hostProbeRunningForChannel =
+    Boolean(cachedHostAppVersion.promise) && cachedHostAppVersion.channel === effectiveHostChannel;
+  if (!SAFE_MODE && !RUN_ONCE && enabled && minAntigravityVersion && hostProbeNeeded && !hostProbeRunningForChannel) {
+    const prevHostVer = hostAppVersion;
+    void resolveHostAppVersionAsync({ channel: effectiveHostChannel }).then((ver) => {
+      if (ver && (ver !== updateCheckState.hostAppVersion || ver !== prevHostVer)) {
         updateCheckState.hostAppVersion = ver;
-        if (!daemonExiting && attachedTargets.size > 0) {
+        cachedBundleSig = '';
+        if (!daemonExiting) {
           broadcastUpdateStatusToTargets(getPublicUpdateStatus());
         }
       }
     });
   }
+  const persistedUpgradeError =
+    updateAvailable &&
+    updateCheckState.upgradeError &&
+    (!updateCheckState.upgradeFailedVersion || updateCheckState.upgradeFailedVersion === latestVersion)
+      ? updateCheckState.upgradeError
+      : null;
   return {
     enabled,
     currentVersion,
@@ -793,32 +1179,48 @@ function getPublicUpdateStatus() {
     upgradeCommand: `node ${JSON.stringify(path.join(ROOT_DIR, 'install.mjs'))} upgrade`,
     checking: updateCheckInFlight,
     upgrading: updateUpgradeInFlight,
-    upgradeError: lastUpgradeError || null
+    upgradeError: lastUpgradeError || persistedUpgradeError || null,
+    checkError: lastManualCheckError || null
   };
 }
 
 function getUpdateStatusPreloadSig() {
   if (SAFE_MODE || activeConfig?.modules?.updateCheck === false) return 'off';
-  const st = getPublicUpdateStatus();
-  return `${st.currentVersion || ''}|${st.latestVersion || ''}|${st.updateAvailable ? 1 : 0}|${st.dismissed ? 1 : 0}|${st.incompatibleHost ? 1 : 0}|${st.incompatibleNode ? 1 : 0}|${st.checkedAt || ''}|${st.checking ? 1 : 0}|${st.upgrading ? 1 : 0}|${st.upgradeError || ''}`;
+  return JSON.stringify(getPublicUpdateStatus());
 }
 
-function broadcastUpdateStatusToTargets(statusPayload) {
-  if (!activeConfig?.enabled) return;
-  cachedBundleSig = '';
-  rebuildBundleIfNeeded({ fromUiPersist: true });
+function pushUpdateStatusToTargets(statusPayload) {
+  if (!activeConfig?.enabled || activeConfig?.modules?.updateCheck === false) return;
   const expr = `window.__ag_on_update_status && window.__ag_on_update_status(${JSON.stringify(statusPayload)})`;
   const tasks = [];
   for (const [, entry] of attachedTargets.entries()) {
     if (!entry?.hostConfirmed || entry.type !== 'page') continue;
     if (entry.updateNewDocScript) {
-      tasks.push(entry.updateNewDocScript(true).catch(() => {}));
+      tasks.push(entry.updateNewDocScript().catch(() => {}));
     }
     if (entry.send) {
       tasks.push(entry.send('Runtime.evaluate', { expression: expr, returnByValue: false }).catch(() => {}));
     }
   }
   if (tasks.length > 0) void Promise.allSettled(tasks);
+}
+
+let lastSyncedPatchVersion = '';
+
+function broadcastUpdateStatusToTargets(statusPayload) {
+  const prevPatchVer = cachedPatchVersion;
+  cachedBundleSig = '';
+  rebuildBundleIfNeeded({ fromUiPersist: true });
+  pushUpdateStatusToTargets(statusPayload);
+  if (prevPatchVer && cachedPatchVersion !== prevPatchVer) {
+    const tasks = [];
+    for (const [, entry] of attachedTargets.entries()) {
+      if (!entry?.hostConfirmed) continue;
+      if (entry.updateNewDocScript) tasks.push(entry.updateNewDocScript().catch(() => {}));
+      if (entry.checkAndInject) tasks.push(entry.checkAndInject().catch(() => {}));
+    }
+    if (tasks.length > 0) void Promise.allSettled(tasks);
+  }
 }
 
 function execFileAsync(bin, cmdArgs, timeoutMs = 8000, signal = null) {
@@ -989,18 +1391,29 @@ async function checkForPatchUpdateAsync({ force = false } = {}) {
   if (SAFE_MODE || RUN_ONCE || daemonExiting) return false;
   if (activeConfig?.modules?.updateCheck === false) return false;
   if (updateCheckInFlight) return false;
+  if (updateUpgradeInFlight || isActiveUpgradeLockHeldOnDisk()) return false;
 
   const now = Date.now();
+  if (!updateCheckState.loaded) readUpdateCacheFromDisk();
   if (force) {
     if (now - lastManualUpdateCheckAt < UPDATE_MANUAL_COOLDOWN_MS) return false;
     lastManualUpdateCheckAt = now;
   } else {
-    if (!updateCheckState.loaded) readUpdateCacheFromDisk();
     if (lastUpdateErrorAt && now - lastUpdateErrorAt < UPDATE_CHECK_ERROR_BACKOFF_MS) return false;
     const lastCheckedMs = updateCheckState.checkedAt ? Date.parse(updateCheckState.checkedAt) : 0;
     if (Number.isFinite(lastCheckedMs) && lastCheckedMs > 0 && now - lastCheckedMs < UPDATE_CHECK_INTERVAL_MS) {
       return false;
     }
+  }
+
+  const prevLastUpgradeError = lastUpgradeError;
+  const prevUpgradeError = updateCheckState.upgradeError || null;
+  const prevUpgradeFailedVer = updateCheckState.upgradeFailedVersion || null;
+  if (force) {
+    lastUpgradeError = '';
+    lastManualCheckError = '';
+    updateCheckState.upgradeError = null;
+    updateCheckState.upgradeFailedVersion = null;
   }
 
   updateCheckInFlight = true;
@@ -1017,6 +1430,7 @@ async function checkForPatchUpdateAsync({ force = false } = {}) {
         const parsed = JSON.parse(txt.replace(/^\uFEFF/, ''));
         if (parsed && typeof parsed === 'object' && typeof parsed.version === 'string' && parsed.coreUpdateBundle) {
           const cleanVer = parsed.version.trim().replace(/^v/i, '');
+          if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(cleanVer)) return null;
           const releaseUrl =
             typeof parsed.fullReleaseUrl === 'string' && isAllowedOfficialReleasePageUrl(parsed.fullReleaseUrl)
               ? parsed.fullReleaseUrl
@@ -1044,7 +1458,7 @@ async function checkForPatchUpdateAsync({ force = false } = {}) {
     const r2Promise = fetchManifestCandidate({ id: 'cloudflare-r2', url: UPDATE_OFFICIAL_R2_URL });
     const ghManifestPromise = fetchManifestCandidate({ id: 'github-release', url: UPDATE_OFFICIAL_GH_URL });
     const ghRedirectPromise = resolveGithubLatestTagAsync(6000, ac.signal, proxyInfo).catch(() => null);
-    const hostVersionPromise = resolveHostAppVersionAsync().catch(() => null);
+    const hostVersionPromise = resolveHostAppVersionAsync({ force }).catch(() => null);
 
     let resolved = await firstTruthyAsync([r2Promise, ghManifestPromise]);
     if (resolved) {
@@ -1054,11 +1468,17 @@ async function checkForPatchUpdateAsync({ force = false } = {}) {
     }
 
     if (!resolved) {
+      if (force) {
+        lastUpgradeError = prevLastUpgradeError;
+        lastManualCheckError = 'check_failed';
+        updateCheckState.upgradeError = prevUpgradeError;
+        updateCheckState.upgradeFailedVersion = prevUpgradeFailedVer;
+      }
       lastUpdateErrorAt = Date.now();
       return false;
     }
 
-    const hostAppVersion = await hostVersionPromise;
+    const hostAppVersion = (await hostVersionPromise) || updateCheckState.hostAppVersion || null;
     const currentVersion = getInstalledCurrentVersion();
     const checkedAt = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     const prevDismissed = updateCheckState.dismissedVersion || null;
@@ -1070,6 +1490,12 @@ async function checkForPatchUpdateAsync({ force = false } = {}) {
     const incompatibleHost = Boolean(semverNewer && !hostCompatible);
     const incompatibleNode = Boolean(semverNewer && !nodeCompatible);
     const updateAvailable = Boolean(semverNewer && hostCompatible && nodeCompatible);
+    const keepPrevUpgradeError = Boolean(
+      !force &&
+        updateAvailable &&
+        prevUpgradeError &&
+        (!prevUpgradeFailedVer || prevUpgradeFailedVer === resolved.latestVersion)
+    );
     const nextCache = {
       checkedAt,
       source: resolved.source,
@@ -1082,13 +1508,24 @@ async function checkForPatchUpdateAsync({ force = false } = {}) {
       incompatibleHost,
       incompatibleNode,
       dismissedVersion: force || !updateAvailable ? null : prevDismissed,
+      upgradeError: keepPrevUpgradeError ? prevUpgradeError : null,
+      upgradeFailedVersion: keepPrevUpgradeError ? prevUpgradeFailedVer || resolved.latestVersion : null,
       changelog: resolved.changelog,
       bundleBytes: resolved.bundleBytes,
       releaseUrl: resolved.releaseUrl
     };
+    if (updateUpgradeInFlight || isActiveUpgradeLockHeldOnDisk()) {
+      if (force && !updateUpgradeInFlight) {
+        lastUpgradeError = prevLastUpgradeError;
+        updateCheckState.upgradeError = prevUpgradeError;
+        updateCheckState.upgradeFailedVersion = prevUpgradeFailedVer;
+      }
+      return false;
+    }
     updateCheckState = { loaded: true, ...nextCache };
     writeUpdateCacheAtomic(nextCache);
     lastUpdateErrorAt = 0;
+    lastManualCheckError = '';
     return true;
   } finally {
     ac.abort();
@@ -1178,6 +1615,29 @@ function readUpgradeLogTailSummary(logPath) {
   }
 }
 
+function isActiveUpgradeLockHeldOnDisk(ignorePid = 0) {
+  try {
+    const lockPath = path.join(CACHE_DIR, 'upgrade.lock');
+    if (!fs.existsSync(lockPath)) return false;
+    const st = fs.statSync(lockPath);
+    if (Date.now() - st.mtimeMs > 15 * 60 * 1000) return false;
+    const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    const holderPid = Number(parsed?.pid) || 0;
+    const selfChildPid = Number(ignorePid) || 0;
+    if (holderPid <= 0 || holderPid === process.pid || (selfChildPid > 0 && holderPid === selfChildPid)) {
+      return false;
+    }
+    try {
+      process.kill(holderPid, 0);
+      return true;
+    } catch (err) {
+      return Boolean(err && err.code === 'EPERM');
+    }
+  } catch {
+    return false;
+  }
+}
+
 function triggerInPlaceHotUpgradeAsync() {
   if (SAFE_MODE || RUN_ONCE || daemonExiting) return false;
   if (activeConfig?.modules?.updateCheck === false) return false;
@@ -1204,10 +1664,34 @@ function triggerInPlaceHotUpgradeAsync() {
     broadcastUpdateStatusToTargets(getPublicUpdateStatus());
     return false;
   }
+  if (isActiveUpgradeLockHeldOnDisk()) {
+    lastUpgradeError = 'Another upgrade process is already running';
+    broadcastUpdateStatusToTargets(getPublicUpdateStatus());
+    return false;
+  }
 
   lastUpgradeTriggerAt = now;
   updateUpgradeInFlight = true;
   lastUpgradeError = '';
+  lastManualCheckError = '';
+  updateCheckState.upgradeError = null;
+  updateCheckState.upgradeFailedVersion = null;
+  if (!isActiveUpgradeLockHeldOnDisk()) {
+    const diskCache = readJsonSafe(UPDATE_CACHE_FILE, null);
+    if (
+      diskCache &&
+      typeof diskCache === 'object' &&
+      !Array.isArray(diskCache) &&
+      (diskCache.upgradeError || diskCache.upgradeFailedVersion)
+    ) {
+      writeUpdateCacheAtomic({
+        ...diskCache,
+        upgradeError: null,
+        upgradeFailedVersion: null
+      });
+    }
+  }
+  const preSpawnCacheSig = getAtomicFileDiskSig(UPDATE_CACHE_FILE);
   broadcastUpdateStatusToTargets(getPublicUpdateStatus());
 
   let logFd = null;
@@ -1220,7 +1704,11 @@ function triggerInPlaceHotUpgradeAsync() {
 
   let child = null;
   try {
-    child = spawn(process.execPath, [installScript, 'upgrade'], {
+    const upgradeArgs = [installScript, 'upgrade'];
+    if (CLI_CHANNEL === 'stable' || CLI_CHANNEL === 'insiders' || CLI_CHANNEL === 'auto') {
+      upgradeArgs.push('--channel', CLI_CHANNEL);
+    }
+    child = spawn(process.execPath, upgradeArgs, {
       cwd: ROOT_DIR,
       detached: true,
       windowsHide: true,
@@ -1278,8 +1766,46 @@ function triggerInPlaceHotUpgradeAsync() {
       lastUpgradeError = '';
       readUpdateCacheFromDisk();
     } else {
-      const detail = errMsg || readUpgradeLogTailSummary(UPDATE_UPGRADE_LOG_FILE) || `Exit code ${code}`;
+      const cacheRewrittenByChild = getAtomicFileDiskSig(UPDATE_CACHE_FILE) !== preSpawnCacheSig;
+      const externalLockHeld = isActiveUpgradeLockHeldOnDisk(child?.pid || 0);
+      readUpdateCacheFromDisk();
+      const childDiskError = cacheRewrittenByChild ? updateCheckState.upgradeError : '';
+      const detail =
+        errMsg || childDiskError || readUpgradeLogTailSummary(UPDATE_UPGRADE_LOG_FILE) || `Exit code ${code}`;
       lastUpgradeError = String(detail).slice(0, 140);
+      if (!cacheRewrittenByChild) {
+        updateCheckState.upgradeError = null;
+        updateCheckState.upgradeFailedVersion = null;
+      }
+      const statusSnap = getPublicUpdateStatus();
+      if (
+        updateCheckState.loaded &&
+        updateCheckState.latestVersion &&
+        statusSnap.updateAvailable &&
+        !externalLockHeld &&
+        updateCheckState.upgradeError !== lastUpgradeError
+      ) {
+        const persisted = {
+          checkedAt: updateCheckState.checkedAt,
+          source: updateCheckState.source,
+          currentVersion: statusSnap.currentVersion,
+          latestVersion: updateCheckState.latestVersion,
+          updateAvailable: statusSnap.updateAvailable,
+          minAntigravityVersion: updateCheckState.minAntigravityVersion,
+          minNodeVersion: updateCheckState.minNodeVersion,
+          hostAppVersion: statusSnap.hostAppVersion,
+          incompatibleHost: statusSnap.incompatibleHost,
+          incompatibleNode: statusSnap.incompatibleNode,
+          dismissedVersion: updateCheckState.dismissedVersion,
+          upgradeError: lastUpgradeError,
+          upgradeFailedVersion: updateCheckState.latestVersion,
+          changelog: updateCheckState.changelog,
+          bundleBytes: updateCheckState.bundleBytes,
+          releaseUrl: updateCheckState.releaseUrl || UPDATE_OFFICIAL_GH_LATEST_URL
+        };
+        updateCheckState = { loaded: true, ...persisted };
+        writeUpdateCacheAtomic(persisted);
+      }
     }
     if (!daemonExiting) {
       broadcastUpdateStatusToTargets(getPublicUpdateStatus());
@@ -1307,13 +1833,19 @@ function triggerInPlaceHotUpgradeAsync() {
     forceKillFallbackTimer = setTimeout(() => {
       forceKillFallbackTimer = null;
       if (settled) return;
-      if (process.platform !== 'win32' && child.pid) {
-        try {
-          process.kill(-child.pid, 'SIGKILL');
-        } catch {
+      if (child.pid) {
+        if (process.platform === 'win32') {
           try {
             child.kill('SIGKILL');
           } catch {}
+        } else {
+          try {
+            process.kill(-child.pid, 'SIGKILL');
+          } catch {
+            try {
+              child.kill('SIGKILL');
+            } catch {}
+          }
         }
       }
       finishUpgrade(1, 'Timed out waiting for hot upgrade');
@@ -1330,6 +1862,17 @@ function triggerInPlaceHotUpgradeAsync() {
     finishUpgrade(1, err?.message || String(err));
   });
   child.once('close', (code) => {
+    if (child?.pid) {
+      try {
+        const lockPath = path.join(CACHE_DIR, 'upgrade.lock');
+        if (fs.existsSync(lockPath)) {
+          const parsedLock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+          if (Number(parsedLock?.pid) === child.pid) {
+            fs.unlinkSync(lockPath);
+          }
+        }
+      } catch {}
+    }
     finishUpgrade(timedOut ? 1 : typeof code === 'number' ? code : 1, timedOut ? 'Timed out waiting for hot upgrade' : '');
   });
   return true;
@@ -2404,12 +2947,18 @@ function rebuildBundleIfNeeded(opts = {}) {
         path.join(USER_DIR, 'custom.js')
       ];
 
+  const curSemver = getInstalledCurrentVersion();
   const hostThemeMode = readHostThemeMode();
   const editorsState = getExternalEditorsBundleState();
-  const sig =
+  const baseSig =
     [...coreFiles, ...userFiles].map(getFileMtimeSig).join('|') +
-    `|hostTheme:${hostThemeMode || ''}|safe:${SAFE_MODE}|cli:${CLI_CHANNEL || ''}|editors:${editorsState.sig}`;
-  if (sig === cachedBundleSig && cachedInjectScript) {
+    `|ver:${curSemver}|manifest:${getAtomicFileDiskSig(path.join(CORE_DIR, 'manifest.json'))}|hostTheme:${hostThemeMode || ''}|safe:${SAFE_MODE}|cli:${CLI_CHANNEL || ''}|editors:${editorsState.sig}`;
+  const sigPrefix = `${baseSig}|upd:`;
+  if (
+    cachedInjectScript &&
+    cachedBundleSig.startsWith(sigPrefix) &&
+    cachedBundleSig === `${sigPrefix}${getUpdateStatusPreloadSig()}`
+  ) {
     return false;
   }
 
@@ -2615,6 +3164,7 @@ function rebuildBundleIfNeeded(opts = {}) {
     .update(customJs)
     .update(
       JSON.stringify({
+        curSemver,
         installedLocale,
         i18nOverrideKeys,
         metricsMode,
@@ -2642,7 +3192,7 @@ function rebuildBundleIfNeeded(opts = {}) {
   }
 
   const channelTag = channel === 'insiders' ? 'insiders' : 'stable';
-  cachedPatchVersion = `${BASE_VERSION}-${channelTag}-${hash}`;
+  cachedPatchVersion = `20261127-v${curSemver}-${channelTag}-${hash}`;
 
   const RE_STRIP_TA_CSS = /\/\* __AG_TOKEN_ANALYTICS_CSS_START__ \*\/[\s\S]*?\/\* __AG_TOKEN_ANALYTICS_CSS_END__ \*\//g;
   const RE_STRIP_TA_JS = /\/\* __AG_TOKEN_ANALYTICS_JS_START__ \*\/[\s\S]*?\/\* __AG_TOKEN_ANALYTICS_JS_END__ \*\//g;
@@ -2708,7 +3258,7 @@ function rebuildBundleIfNeeded(opts = {}) {
     '})(__AG_BOOT_PAYLOAD__);',
     () => `})(${JSON.stringify(iframePayload)});`
   );
-  cachedBundleSig = sig;
+  cachedBundleSig = `${sigPrefix}${getUpdateStatusPreloadSig()}`;
   return true;
 }
 
@@ -6624,7 +7174,7 @@ function isExternalNonHostBrowserProduct(browserStr, userAgentStr = '') {
   const ua = String(userAgentStr || '').trim();
   if (!b && !ua) return false;
   if (/electron|antigravity/i.test(b) || /electron\/|antigravity\//i.test(ua)) return false;
-  return /^(?:Headless)?Chrome\/|^Edg\/|^Brave\//i.test(b);
+  return /^(?:Headless)?Chrome\/|^Chromium\/|^Edg(?:e|A|iOS)?\/|^Brave\/|^Firefox\/|^OPR\/|^Vivaldi\//i.test(b);
 }
 
 function fetchBrowserVersionInfo(port) {
@@ -7504,7 +8054,7 @@ function attachTarget(target, endpoint) {
       };
 
       const ensurePreloadContextMenuHook = () => {
-        const endpointKey = `${endpoint.channel}:${endpoint.port}`;
+        const endpointKey = `${endpoint.channel}:${endpoint.activePort || endpoint.fallbackPort || 'default'}`;
         if (
           target.type !== 'page' ||
           !hostConfirmed ||
@@ -7698,6 +8248,13 @@ function attachTarget(target, endpoint) {
       let lastNewDocSig = '';
 
       const buildTargetInjectScript = () => {
+        const diskChanged = syncUpdateDiskStateIfChanged({ deferRebuild: true });
+        if (diskChanged || !cachedBundleSig || !cachedInjectScript) {
+          rebuildBundleIfNeeded();
+          if (diskChanged && activeConfig.enabled && activeConfig.modules?.updateCheck !== false) {
+            pushUpdateStatusToTargets(getPublicUpdateStatus());
+          }
+        }
         const uiLangVal = activeConfig.modules?.i18n === false ? 'en' : 'target';
         if (target.type !== 'iframe') {
           return {
@@ -7999,14 +8556,18 @@ function attachTarget(target, endpoint) {
             } catch {}
             return;
           }
+          const expectedWindowPatchVer = activeConfig.enabled ? cachedPatchVersion : `${cachedPatchVersion}-disabled`;
+          const expectedStyleReadyExpr = activeConfig.enabled
+            ? '(window.__ag_body_ready === true && !!document.getElementById("ag-custom-fonts"))'
+            : '!document.getElementById("ag-custom-fonts")';
           if (isExemptInternalTarget({ type: target.type, url: currentTargetUrl })) {
             const checkRes = await send('Runtime.evaluate', {
               expression:
                 '({ ok: window.__ag_patch_version === ' +
-                JSON.stringify(cachedPatchVersion) +
-                ' && (' +
-                JSON.stringify(!activeConfig.enabled) +
-                ' || (window.__ag_body_ready === true && !!document.getElementById("ag-custom-fonts"))), mode: ' +
+                JSON.stringify(expectedWindowPatchVer) +
+                ' && ' +
+                expectedStyleReadyExpr +
+                ', mode: ' +
                 JSON.stringify(target.type === 'iframe' ? 'iframe' : 'page') +
                 ' === "iframe" ? (window.__ag_host_theme_mode || null) : (window.__ag_resolved_theme_mode || null), darkPreset: ' +
                 JSON.stringify(target.type === 'iframe' ? 'iframe' : 'page') +
@@ -8077,7 +8638,7 @@ function attachTarget(target, endpoint) {
           }
           const checkRes = await send('Runtime.evaluate', {
             expression: `({
-              injected: window.__ag_patch_version === ${JSON.stringify(cachedPatchVersion)} && (${JSON.stringify(!activeConfig.enabled)} || (window.__ag_body_ready === true && !!document.getElementById("ag-custom-fonts"))),
+              injected: window.__ag_patch_version === ${JSON.stringify(expectedWindowPatchVer)} && ${expectedStyleReadyExpr},
               skipNonHost: window.__ag_skip_non_host === true,
               kind: ${HOST_PROBE_EXPRESSION},
               mode: window.__ag_resolved_theme_mode || null,
@@ -8596,12 +9157,12 @@ function attachTarget(target, endpoint) {
             }
             const act = String(req?.action || '').trim();
             if (act === 'check') {
-              lastUpgradeError = '';
               void checkForPatchUpdateAsync({ force: true });
             } else if (act === 'upgrade') {
               triggerInPlaceHotUpgradeAsync();
             } else if (act === 'dismiss') {
               lastUpgradeError = '';
+              lastManualCheckError = '';
               const rawVer = String(req?.version || '').trim().replace(/^v/i, '');
               if (/^\d+\.\d+\.\d+$/.test(rawVer)) {
                 if (!updateCheckState.loaded) readUpdateCacheFromDisk();
@@ -8618,6 +9179,8 @@ function attachTarget(target, endpoint) {
                   incompatibleHost: statusBefore.incompatibleHost,
                   incompatibleNode: statusBefore.incompatibleNode,
                   dismissedVersion: rawVer,
+                  upgradeError: null,
+                  upgradeFailedVersion: null,
                   changelog: updateCheckState.changelog,
                   bundleBytes: updateCheckState.bundleBytes,
                   releaseUrl: updateCheckState.releaseUrl || UPDATE_OFFICIAL_GH_LATEST_URL
@@ -8627,6 +9190,7 @@ function attachTarget(target, endpoint) {
                 broadcastUpdateStatusToTargets(getPublicUpdateStatus());
               }
             } else if (act === 'clearDismiss') {
+              lastManualCheckError = '';
               if (!updateCheckState.loaded) readUpdateCacheFromDisk();
               const statusBefore = getPublicUpdateStatus();
               const nextCache = {
@@ -8641,6 +9205,8 @@ function attachTarget(target, endpoint) {
                 incompatibleHost: statusBefore.incompatibleHost,
                 incompatibleNode: statusBefore.incompatibleNode,
                 dismissedVersion: null,
+                upgradeError: updateCheckState.upgradeError || null,
+                upgradeFailedVersion: updateCheckState.upgradeFailedVersion || null,
                 changelog: updateCheckState.changelog,
                 bundleBytes: updateCheckState.bundleBytes,
                 releaseUrl: updateCheckState.releaseUrl || UPDATE_OFFICIAL_GH_LATEST_URL
@@ -10060,8 +10626,12 @@ async function sync() {
     ) {
       await refreshInstalledExternalEditorsAsync({ force: true });
     }
-    syncUpdateDiskStateIfChanged();
-    const bundleChanged = rebuildBundleIfNeeded();
+    const updateDiskChanged = syncUpdateDiskStateIfChanged({ deferRebuild: true });
+    const rawBundleChanged = rebuildBundleIfNeeded();
+    const bundleChanged = rawBundleChanged || (Boolean(lastSyncedPatchVersion) && cachedPatchVersion !== lastSyncedPatchVersion);
+    if (updateDiskChanged && activeConfig.enabled && activeConfig.modules?.updateCheck !== false) {
+      pushUpdateStatusToTargets(getPublicUpdateStatus());
+    }
     if (!activeConfig.enabled) {
       targetThemeModes.clear();
       targetDarkPresets.clear();
@@ -10094,11 +10664,13 @@ async function sync() {
           ? browserWatchers.get(`${endpoint.channel}:${activePort}`)
           : null;
       if (liveWatcher && liveWatcher.ws && liveWatcher.ws.readyState === WebSocket.OPEN) {
+        endpoint.activePort = activePort;
         probedPorts.add(activePort);
         reachableChannels.add(endpoint.channel);
         liveWatcher.endpoint = endpoint;
         for (const [id, entry] of attachedTargets.entries()) {
           if ((entry.endpoint?.channel || 'stable') !== endpoint.channel) continue;
+          if (entry.endpoint) entry.endpoint.activePort = activePort;
           const rs = entry.ws?.readyState;
           if (rs === WebSocket.OPEN || rs === WebSocket.CONNECTING) {
             activeTargetIds.add(id);
@@ -10116,9 +10688,14 @@ async function sync() {
       if (activePort && !probedPorts.has(activePort)) {
         probedPorts.add(activePort);
         const res = await fetchTargetsResult(activePort);
-        reachable = res.reachable;
-        targets = res.targets;
-        if (reachable) fromPortFile = true;
+        if (res.reachable) {
+          const verInfo = await fetchBrowserVersionInfo(activePort);
+          if (!verInfo.externalBrowser) {
+            reachable = true;
+            targets = res.targets;
+            fromPortFile = true;
+          }
+        }
       }
       if (
         !reachable &&
@@ -10146,6 +10723,7 @@ async function sync() {
       }
       if (!reachable) continue;
 
+      endpoint.activePort = activePort;
       fullScannedChannels.add(endpoint.channel);
       if (fromPortFile || targets.length > 0) {
         reachableChannels.add(endpoint.channel);
@@ -10213,6 +10791,7 @@ async function sync() {
     // 先同步宿主 page 目标以获取权威深浅色状态，再同步子 Swarm iframe（确保 --once 与冷启动零闪烁）
     await syncTargetBatch(pendingPages);
     await syncTargetBatch(pendingIframes);
+    lastSyncedPatchVersion = cachedPatchVersion;
     for (const entry of fastPathPageEntries) {
       if (entry.hostConfirmed && entry.ws?.readyState === WebSocket.OPEN && entry.syncMetricsForSession) {
         await entry.syncMetricsForSession(false);
